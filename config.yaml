@@ -16,4 +16,4 @@ llama_working_dir_label: /opt/llama.cpp
 
 # Optional absolute path to switch script.
 # If omitted, defaults to <llama_dir>/switch-llm.sh.
-# switch_script: /opt/llama.cpp/switch-llm.sh
+switch_script: /gpu-monitor/switch-llm.sh

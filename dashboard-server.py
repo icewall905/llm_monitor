@@ -322,6 +322,8 @@ def _has_recent_event(category: str, within_sec: float = 60.0) -> bool:
 
 
 def _process_log_line(raw_line: str) -> None:
+    match = _LOG_TS_RE.search(raw_line)
+    ts_iso = match.group(0).strip() if match else None
     clean = _LOG_TS_RE.sub("", raw_line.strip(), count=1)
     for severity, category, pattern in _LOG_PATTERNS:
         if pattern.search(clean):
@@ -549,27 +551,47 @@ def find_model_server_container_name(model_key: str, containers: list[dict]) -> 
     return None
 
 
-def parse_latest_completion(log_text: str) -> tuple[float | None, float | None, int | None, str | None, str | None]:
+def parse_latest_completion(log_text: str) -> tuple[float | None, float | None, int | None, str | None, str | None, float | None]:
     latest_gen_tps = None
     latest_ingest_tps = None
     latest_task_id = None
     latest_eval_line = None
     latest_ingest_line = None
+    latest_ts_f = None
     current_task_id = None
     for line in log_text.splitlines():
+        # Handle timestamp prefix
+        ts_match = _LOG_TS_RE.search(line)
+        line_ts_f = None
+        if ts_match:
+            try:
+                line_ts_f = datetime.fromisoformat(ts_match.group(0).strip().replace("Z", "+00:00")).timestamp()
+            except Exception:
+                pass
+            line = _LOG_TS_RE.sub("", line, count=1)
+
         task_match = TIMING_TASK_PATTERN.search(line)
         if task_match:
             current_task_id = int(task_match.group(1))
+
         ingest_match = INGEST_TPS_PATTERN.search(line)
         if ingest_match:
-            latest_ingest_tps = float(ingest_match.group(1))
-            latest_ingest_line = line.strip()
+            val = float(ingest_match.group(1))
+            if val < 20000: # Sanity check
+                latest_ingest_tps = val
+                latest_ingest_line = line.strip()
+                if line_ts_f: latest_ts_f = line_ts_f
+
         match = EVAL_TPS_PATTERN.search(line)
         if match:
-            latest_gen_tps = float(match.group(1))
-            latest_task_id = current_task_id
-            latest_eval_line = line.strip()
-    return latest_gen_tps, latest_ingest_tps, latest_task_id, latest_eval_line, latest_ingest_line
+            val = float(match.group(1))
+            if val < 20000: # Sanity check
+                latest_gen_tps = val
+                latest_task_id = current_task_id
+                latest_eval_line = line.strip()
+                if line_ts_f: latest_ts_f = line_ts_f
+
+    return latest_gen_tps, latest_ingest_tps, latest_task_id, latest_eval_line, latest_ingest_line, latest_ts_f
 
 
 def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) -> dict:
@@ -755,7 +777,7 @@ def build_throughput_status(active_key: str | None, containers: list[dict]) -> d
         ):
             return dict(cached)
 
-    code, output = run_command(["docker", "logs", "--tail", str(THROUGHPUT_LOG_TAIL_LINES), container])
+    code, output = run_command(["docker", "logs", "--timestamps", "--tail", str(THROUGHPUT_LOG_TAIL_LINES), container])
     if code != 0:
         result = {
             "tokens_per_second": None,
@@ -769,7 +791,7 @@ def build_throughput_status(active_key: str | None, containers: list[dict]) -> d
             "detail": "Failed to read llama.cpp logs",
         }
     else:
-        gen_tps, ingest_tps, completion_id, completion_line, ingest_line = parse_latest_completion(output)
+        gen_tps, ingest_tps, completion_id, completion_line, ingest_line, ts_f = parse_latest_completion(output)
         completion_key = (
             f"task:{completion_id}" if completion_id is not None else f"line:{completion_line}"
         )
@@ -779,6 +801,7 @@ def build_throughput_status(active_key: str | None, containers: list[dict]) -> d
                 "ingest_tps": None,
                 "completion_id": None,
                 "completion_key": None,
+                "ts_f": ts_f,
                 "source": "logs",
                 "updated_at": now_iso(),
                 "container": container,
@@ -791,6 +814,7 @@ def build_throughput_status(active_key: str | None, containers: list[dict]) -> d
                 "ingest_tps": ingest_tps,
                 "completion_id": completion_id,
                 "completion_key": completion_key,
+                "ts_f": ts_f,
                 "source": "logs",
                 "updated_at": now_iso(),
                 "container": container,
@@ -816,7 +840,9 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
             "live_state": "unavailable",
             "live_average_tps": None,
             "last_completed_tps": None,
+            "last_ingest_tps": None,
             "last_completed_at": None,
+            "last_completed_at_f": None,
             "completed_count": 0,
             "average_rate_tps": None,
         }
@@ -834,7 +860,9 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
                 "live_samples": 0,
                 "live_average_tps": None,
                 "last_completed_tps": None,
+                "last_ingest_tps": None,
                 "last_completed_at": None,
+                "last_completed_at_f": None,
                 "last_completed_completion_key": None,
                 "completed_count": 0,
                 "completed_sum_tps": 0.0,
@@ -870,6 +898,7 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
             if isinstance(completion_ingest, (int, float)):
                 stats["last_ingest_tps"] = float(completion_ingest)
             stats["last_completed_at"] = now
+            stats["last_completed_at_f"] = completed.get("ts_f")
             stats["last_completed_completion_key"] = completion_key
             stats["completed_count"] += 1
             stats["completed_sum_tps"] += float(completion_tps)
@@ -884,6 +913,7 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
             "last_completed_tps": stats["last_completed_tps"],
             "last_ingest_tps": stats["last_ingest_tps"],
             "last_completed_at": stats["last_completed_at"],
+            "last_completed_at_f": stats["last_completed_at_f"],
             "completed_count": stats["completed_count"],
             "average_rate_tps": stats["average_rate_tps"],
         }
@@ -2089,8 +2119,16 @@ INDEX_HTML = r"""<!doctype html>
       // Quick stats - show live TPS (0 when idle)
       const liveTps = stats.live_tps || 0;
       document.getElementById('val-tps').textContent = liveTps > 0 ? liveTps.toFixed(1) : '0.0';
-      const ingestTps = stats.last_ingest_tps;
-      document.getElementById('val-ingest').textContent = ingestTps != null ? ingestTps.toFixed(1) : '--';
+
+      // Ingest Speed Logic: Show 0 until first run, then keep for 10 seconds.
+      let ingestVal = '0.0';
+      if (stats.last_ingest_tps != null && stats.last_completed_at_f != null) {
+        const ageSec = (Date.now() / 1000) - stats.last_completed_at_f;
+        if (ageSec < 10) {
+          ingestVal = stats.last_ingest_tps.toFixed(1);
+        }
+      }
+      document.getElementById('val-ingest').textContent = ingestVal;
       document.getElementById('val-util').textContent = gpu.util != null ? `${gpu.util}%` : '--%';
       document.getElementById('bar-util').style.width = `${gpu.util || 0}%`;
       const vramGB = ((gpu.mem_used || 0) / 1024).toFixed(1);

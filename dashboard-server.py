@@ -246,7 +246,7 @@ _LOG_PATTERNS = [
     ("warning", "health",     re.compile(r"health check failed|unhealthy", re.I)),
     ("info",    "loading",    re.compile(r"llm_load_tensors|llama_new_context_with_model|print_info|model size\s*=|loaded meta data", re.I)),
     ("info",    "loading",    re.compile(r"\.\s+\d+\.?\d*\s*[%％]", re.I)),
-    ("info",    "ready",      re.compile(r"HTTP server listening|server is listening|all slots are idle", re.I)),
+    ("info",    "ready",      re.compile(r"HTTP server listening|server is listening", re.I)),
 ]
 MODEL_STATS_LOCK = threading.Lock()
 MODEL_STATS = {

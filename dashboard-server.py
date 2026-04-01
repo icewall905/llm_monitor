@@ -1664,12 +1664,13 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--card);
       border: 1px solid var(--border-strong);
       border-radius: 12px;
-      padding: 18px;
+      padding: 14px;
       display: flex;
       flex-direction: column;
-      gap: 14px;
+      gap: 10px;
     }
     .info-item { display: flex; flex-direction: column; gap: 3px; }
+    .info-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .info-label { font-size: 10px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
     .info-value { font-size: 13px; font-weight: 600; font-family: var(--font-mono); }
     .info-row { display: flex; justify-content: space-between; align-items: center; }
@@ -1853,24 +1854,27 @@ INDEX_HTML = r"""<!doctype html>
             <div class="info-value" id="info-model" style="color: var(--success); font-size: 12px; line-height: 1.4">NONE</div>
           </div>
           <div class="info-item">
-            <div class="info-label">Model Info</div>
             <div class="info-badges" id="info-badges"></div>
           </div>
-          <div class="info-item">
-            <div class="info-label">Average Rate</div>
-            <div class="info-value" id="info-avg-rate">-- T/S</div>
+          <div class="info-pair">
+            <div class="info-item">
+              <div class="info-label">Avg Rate</div>
+              <div class="info-value" id="info-avg-rate">-- T/S</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Completed Runs</div>
+              <div class="info-value" id="info-runs">0</div>
+            </div>
           </div>
-          <div class="info-item">
-            <div class="info-label">Completed Runs</div>
-            <div class="info-value" id="info-runs">0</div>
-          </div>
-          <div class="info-item">
-            <div class="info-label">Clocks (GFX / MEM)</div>
-            <div class="info-value" id="info-clocks">-- / -- MHz</div>
-          </div>
-          <div class="info-item">
-            <div class="info-label">Power Draw</div>
-            <div class="info-value" id="info-power">--W / --W</div>
+          <div class="info-pair">
+            <div class="info-item">
+              <div class="info-label">Clocks (GFX/MEM)</div>
+              <div class="info-value" id="info-clocks" style="font-size:11px">-- / -- MHz</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Power Draw</div>
+              <div class="info-value" id="info-power">--W / --W</div>
+            </div>
           </div>
           <div class="info-item">
             <div class="bench-btn-row">
@@ -1878,17 +1882,19 @@ INDEX_HTML = r"""<!doctype html>
               <button class="btn-benchmark-full" id="btnBenchmarkFull" onclick="triggerBenchmark('full')">RUN FULL BENCHMARK</button>
             </div>
           </div>
-          <div class="info-item">
-            <div class="info-label">Benchmark Prefill</div>
-            <div class="info-value" id="info-bench-prefill">-- T/S</div>
+          <div class="info-pair">
+            <div class="info-item">
+              <div class="info-label">Bench Prefill</div>
+              <div class="info-value" id="info-bench-prefill">-- T/S</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Bench Gen</div>
+              <div class="info-value" id="info-bench-gen">-- T/S</div>
+            </div>
           </div>
           <div class="info-item">
-            <div class="info-label">Benchmark Gen</div>
-            <div class="info-value" id="info-bench-gen">-- T/S</div>
-          </div>
-          <div class="info-item">
-            <div class="info-label">Benchmark Last Run</div>
-            <div class="info-value" id="info-bench-last">--</div>
+            <div class="info-label">Last Run</div>
+            <div class="info-value" id="info-bench-last" style="font-size:11px">--</div>
           </div>
           <div class="info-item">
             <div class="info-label">Benchmark History (Last 10)</div>

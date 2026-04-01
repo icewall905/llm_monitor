@@ -1,0 +1,23 @@
+# LLM_META display_name="Example 8B (Q4_K_M)"
+# LLM_META family="example"
+# LLM_META params="8B"
+# LLM_META quant="Q4_K_M"
+# LLM_META ctx_size="32768"
+# LLM_META thinking="false"
+# LLM_META server_service="llm-server"
+# LLM_META sort_order="100"
+services:
+  llm-server:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /path/to/models:/models:ro
+    environment:
+      LLAMA_ARG_HOST: "0.0.0.0"
+      LLAMA_ARG_PORT: "8080"
+      LLAMA_ARG_MODEL: "/models/your-model.gguf"
+      LLAMA_ARG_CTX_SIZE: "32768"
+      LLAMA_ARG_N_GPU_LAYERS: "999"
+      LLAMA_ARG_FLASH_ATTN: "true"

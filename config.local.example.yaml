@@ -1,0 +1,8 @@
+# Optional local overrides.
+# Copy to config.local.yaml (gitignored) to override settings from config.yaml.
+
+llama_dir: /mnt/nvmestorage/compose/llama.cpp
+stacks_dir: /mnt/nvmestorage/compose/llama.cpp/stacks
+models_dir: /mnt/nvmestorage/compose/llama.cpp/models
+llama_working_dir_label: /mnt/nvmestorage/compose/llama.cpp
+# switch_script: /mnt/nvmestorage/compose/llama.cpp/switch-llm.sh

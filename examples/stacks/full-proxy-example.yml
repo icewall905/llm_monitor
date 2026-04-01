@@ -1,0 +1,58 @@
+# LLM_META display_name="Example 32B (UD-Q4_K_XL)"
+# LLM_META family="example"
+# LLM_META params="32B"
+# LLM_META quant="UD-Q4_K_XL"
+# LLM_META ctx_size="131072"
+# LLM_META thinking="true"
+# LLM_META server_service="example-llm"
+# LLM_META sort_order="110"
+services:
+  example-llm:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /path/to/models:/models:ro
+    environment:
+      LLAMA_ARG_HOST: "0.0.0.0"
+      LLAMA_ARG_PORT: "8080"
+      LLAMA_ARG_MODEL: "/models/your-model.gguf"
+      LLAMA_ARG_CTX_SIZE: "131072"
+      LLAMA_ARG_N_GPU_LAYERS: "999"
+      LLAMA_ARG_CACHE_TYPE_K: "q8_0"
+      LLAMA_ARG_CACHE_TYPE_V: "q8_0"
+      HF_TOKEN: "${HF_TOKEN}"
+
+  ollama-proxy:
+    image: python:3.11-slim
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    depends_on:
+      - example-llm
+    command: >
+      sh -c "pip install flask requests waitress && python /app/ollama-proxy.py"
+    volumes:
+      - /path/to/ollama-proxy.py:/app/ollama-proxy.py:ro
+    environment:
+      OPENAI_API_BASE_URL: "http://example-llm:8080/v1"
+      PROXY_MODEL_FILENAME: "your-model.gguf"
+      REQUEST_TIMEOUT: "900"
+
+  middleware-proxy:
+    image: python:3.11-slim
+    restart: unless-stopped
+    ports:
+      - "28080:28080"
+    depends_on:
+      - example-llm
+    command: >
+      sh -c "pip install flask requests waitress && python /app/middleware-proxy.py"
+    volumes:
+      - /path/to/middleware-proxy.py:/app/middleware-proxy.py:ro
+    environment:
+      OPENAI_API_BASE_URL: "http://example-llm:8080/v1"
+      REQUEST_TIMEOUT: "900"
+      MIDDLEWARE_PORT: "28080"
+      FORCE_DISABLE_THINKING: "false"

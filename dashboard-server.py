@@ -3,6 +3,7 @@ import ast
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
 import threading
@@ -126,6 +127,10 @@ FULL_BENCHMARK_MAX_HISTORY = int(os.environ.get("BENCHMARK_HISTORY_LIMIT", "10")
 BENCHMARK_STALE_SEC = int(
     os.environ.get("BENCHMARK_STALE_SEC", str(max(BENCHMARK_TIMEOUT_SEC * 4, 600)))
 )
+LOG_MAX_EVENTS = int(os.environ.get("LOG_MAX_EVENTS", "100"))
+LOG_WATCHER_INTERVAL_SEC = float(os.environ.get("LOG_WATCHER_INTERVAL_SEC", "2.0"))
+RESTART_LOOP_THRESHOLD = 3
+RESTART_LOOP_WINDOW_SEC = 300.0
 
 # ---------------------------------------------------------------------------
 # Dynamic model discovery from stacks/*.yml LLM_META headers
@@ -233,6 +238,16 @@ INGEST_TPS_PATTERN = re.compile(
     r"prompt eval time\s*=.*?\(\s*[0-9.]+\s+ms per token,\s*([0-9.]+)\s+tokens per second\)"
 )
 TIMING_TASK_PATTERN = re.compile(r"slot print_timing: id\s+\d+\s+\|\s+task\s+(\d+)\s+\|")
+_LOG_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\s+")
+_LOG_PATTERNS = [
+    ("error",   "oom",        re.compile(r"CUDA error: out of memory|cudaMalloc failed|not enough memory|CUDA_ERROR_OUT_OF_MEMORY", re.I)),
+    ("error",   "model_load", re.compile(r"error loading model|failed to load model|unable to open model|llama_model_load: error|failed to mmap", re.I)),
+    ("error",   "config",     re.compile(r"invalid argument|error: unknown argument|unrecognized option", re.I)),
+    ("warning", "health",     re.compile(r"health check failed|unhealthy", re.I)),
+    ("info",    "loading",    re.compile(r"llm_load_tensors|llama_new_context_with_model|print_info|model size\s*=|loaded meta data", re.I)),
+    ("info",    "loading",    re.compile(r"\.\s+\d+\.?\d*\s*[%％]", re.I)),
+    ("info",    "ready",      re.compile(r"HTTP server listening|server is listening|all slots are idle", re.I)),
+]
 MODEL_STATS_LOCK = threading.Lock()
 MODEL_STATS = {
     "active_key": None,
@@ -247,6 +262,15 @@ BENCHMARK_STATE = {
     "last_result": None,
     "last_error": None,
     "history": [],
+}
+LOG_LOCK = threading.Lock()
+LOG_STATE = {
+    "events": [],
+    "error_count": 0,
+    "last_container": None,
+    "last_restart_count": None,
+    "restart_times": [],
+    "watcher_alive": False,
 }
 
 
@@ -268,10 +292,160 @@ def _set_last_message(msg: str) -> None:
         STATE["last_message"] = msg
 
 
+def _append_log_event(severity: str, category: str, message: str) -> None:
+    event = {
+        "ts": now_iso(),
+        "_ts_f": time.time(),
+        "severity": severity,
+        "category": category,
+        "message": message[:300],
+    }
+    with LOG_LOCK:
+        LOG_STATE["events"].append(event)
+        if len(LOG_STATE["events"]) > LOG_MAX_EVENTS:
+            removed = LOG_STATE["events"].pop(0)
+            if removed["severity"] == "error":
+                LOG_STATE["error_count"] = max(0, LOG_STATE["error_count"] - 1)
+        if severity == "error":
+            LOG_STATE["error_count"] += 1
+
+
+def _has_recent_event(category: str, within_sec: float = 60.0) -> bool:
+    cutoff = time.time() - within_sec
+    with LOG_LOCK:
+        for evt in reversed(LOG_STATE["events"]):
+            if evt["_ts_f"] < cutoff:
+                break
+            if evt["category"] == category:
+                return True
+    return False
+
+
+def _process_log_line(raw_line: str) -> None:
+    clean = _LOG_TS_RE.sub("", raw_line.strip(), count=1)
+    for severity, category, pattern in _LOG_PATTERNS:
+        if pattern.search(clean):
+            _append_log_event(severity, category, clean)
+            return
+
+
+def _check_restart_count(container: str) -> None:
+    code, out = run_command(["docker", "inspect", "--format={{.RestartCount}}", container])
+    if code != 0:
+        return
+    try:
+        count = int(out.strip())
+    except ValueError:
+        return
+    now = time.time()
+    recent = 0
+    with LOG_LOCK:
+        prev = LOG_STATE["last_restart_count"]
+        LOG_STATE["last_restart_count"] = count
+        if prev is None or count <= prev:
+            return
+        for _ in range(count - prev):
+            LOG_STATE["restart_times"].append(now)
+        cutoff = now - RESTART_LOOP_WINDOW_SEC
+        LOG_STATE["restart_times"] = [t for t in LOG_STATE["restart_times"] if t >= cutoff]
+        recent = len(LOG_STATE["restart_times"])
+    if recent >= RESTART_LOOP_THRESHOLD and not _has_recent_event("restart_loop", 60):
+        _append_log_event(
+            "error", "restart_loop",
+            f"Restart loop: {recent} restarts in {int(RESTART_LOOP_WINDOW_SEC)}s — check logs for root cause",
+        )
+
+
+def _ingest_log_tail(container: str, tail: int = 50) -> None:
+    code, output = run_command(["docker", "logs", "--tail", str(tail), container])
+    if code == 0:
+        for line in output.splitlines():
+            _process_log_line(line)
+
+
 def run_command(cmd: list[str]) -> tuple[int, str]:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     combined = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, combined.strip()
+
+
+def _run_log_watcher() -> None:
+    """Daemon: streams docker logs and emits events into LOG_STATE."""
+    proc = None
+    current_container: str | None = None
+    while True:
+        try:
+            containers = list_llama_compose_containers()
+            active_key = detect_active_model_key(containers)
+            if not active_key:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    proc = None
+                    current_container = None
+                time.sleep(LOG_WATCHER_INTERVAL_SEC)
+                continue
+
+            target = find_model_server_container_name(active_key, containers)
+            if not target:
+                time.sleep(LOG_WATCHER_INTERVAL_SEC)
+                continue
+
+            _check_restart_count(target)
+
+            for c in containers:
+                if c["name"] == target and "(unhealthy)" in c.get("status", ""):
+                    if not _has_recent_event("health", 30):
+                        _append_log_event(
+                            "warning", "health",
+                            f"Container {target} is unhealthy — health check failing",
+                        )
+
+            if target != current_container:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    proc = None
+                _ingest_log_tail(target, tail=50)
+                proc = subprocess.Popen(
+                    ["docker", "logs", "--follow", "--tail", "0", "--timestamps", target],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                current_container = target
+                with LOG_LOCK:
+                    LOG_STATE["last_container"] = current_container
+                    LOG_STATE["watcher_alive"] = True
+
+            if proc is not None:
+                deadline = time.monotonic() + LOG_WATCHER_INTERVAL_SEC
+                count = 0
+                while count < 200:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    rlist, _, _ = select.select([proc.stdout], [], [], min(remaining, 0.1))
+                    if not rlist:
+                        break
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    _process_log_line(line)
+                    count += 1
+                if proc.poll() is not None:
+                    proc = None
+                    current_container = None
+            else:
+                time.sleep(LOG_WATCHER_INTERVAL_SEC)
+
+        except Exception:
+            time.sleep(LOG_WATCHER_INTERVAL_SEC)
 
 
 def list_llama_compose_containers() -> list[dict]:
@@ -906,11 +1080,43 @@ def start_switch(model_key: str) -> tuple[bool, str]:
         with STATE_LOCK:
             STATE["last_exit_code"] = exit_code
             STATE["last_output"] = output[-4000:]
+            STATE["last_message"] = f"Loading {model['label']}..."
+
+        # Poll until healthy, surfacing log events in last_message
+        deadline = time.time() + SWITCH_READY_TIMEOUT_SEC
+        while time.time() < deadline:
+            local_containers = list_llama_compose_containers()
+            if is_model_server_healthy(model_key, local_containers):
+                with STATE_LOCK:
+                    STATE["switch_in_progress"] = False
+                    STATE["last_completed_at"] = now_iso()
+                    STATE["last_message"] = f"Ready: {model['label']}"
+                return
+
+            with LOG_LOCK:
+                recent_events = list(LOG_STATE["events"])
+            error_found = False
+            for evt in reversed(recent_events):
+                if evt["category"] in ("oom", "model_load", "config", "restart_loop"):
+                    _set_last_message(f"Error loading {model['label']}: {evt['message'][:80]}")
+                    error_found = True
+                    break
+            if not error_found:
+                for evt in reversed(recent_events):
+                    if evt["category"] == "loading":
+                        pct = re.search(r"(\d+(?:\.\d+)?)\s*[%％]", evt["message"])
+                        if pct:
+                            _set_last_message(f"Loading {model['label']}: {pct.group(1)}%")
+                        else:
+                            _set_last_message(f"Loading {model['label']}...")
+                        break
+
+            time.sleep(SWITCH_POLL_SEC)
+
+        with STATE_LOCK:
             STATE["switch_in_progress"] = False
             STATE["last_completed_at"] = now_iso()
-            STATE["last_message"] = (
-                f"Started {model['label']}; model may still be loading"
-            )
+            STATE["last_message"] = f"Load timeout for {model['label']}"
 
     threading.Thread(target=_worker, daemon=True).start()
     return True, f"Switch request accepted: {model['label']}"
@@ -1143,6 +1349,15 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
             for key, m in models.items()
         ],
     }
+
+    with LOG_LOCK:
+        raw_events = list(LOG_STATE["events"])
+        log_error_count = LOG_STATE["error_count"]
+        log_watcher_ok = LOG_STATE["watcher_alive"]
+
+    status["log_events"] = [{k: v for k, v in e.items() if k != "_ts_f"} for e in raw_events]
+    status["log_error_count"] = log_error_count
+    status["log_watcher_ok"] = log_watcher_ok
 
     if handler is not None:
         status["ttyd_url"] = "/ttyd/"
@@ -1522,6 +1737,25 @@ INDEX_HTML = r"""<!doctype html>
       .stats-row { grid-template-columns: 1fr 1fr; }
       .sidebar { display: none; }
     }
+
+    /* ── Events & Logs panel ── */
+    .events-panel { background: var(--card); border: 1px solid var(--border-strong); border-radius: 12px; overflow: hidden; margin-top: 16px; }
+    .events-panel-header { display:flex; align-items:center; justify-content:space-between; padding:12px 18px; border-bottom:1px solid var(--border); cursor:pointer; user-select:none; }
+    .events-panel-header:hover { background:rgba(255,255,255,0.02); }
+    .events-title { font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px; }
+    .events-err-badge { font-size:10px; font-weight:800; padding:2px 7px; border-radius:999px; background:rgba(239,68,68,0.15); color:var(--danger); border:1px solid rgba(239,68,68,0.3); display:none; }
+    .events-body { max-height:220px; overflow-y:auto; padding:6px 0; font-family:var(--font-mono); font-size:12px; }
+    .events-body::-webkit-scrollbar { width:4px; }
+    .events-body::-webkit-scrollbar-thumb { background:var(--border-strong); border-radius:2px; }
+    .events-collapsed .events-body { display:none; }
+    .event-row { display:flex; gap:10px; align-items:baseline; padding:3px 18px; border-bottom:1px solid rgba(255,255,255,0.03); }
+    .event-row:last-child { border-bottom:none; }
+    .event-ts { color:var(--text-muted); font-size:10px; white-space:nowrap; flex-shrink:0; }
+    .event-sev { font-size:10px; font-weight:800; width:52px; flex-shrink:0; }
+    .ev-error { color:var(--danger); } .ev-warning { color:var(--warning); } .ev-info { color:var(--success); }
+    .event-msg { flex:1; color:var(--text-dim); word-break:break-word; }
+    .events-empty-msg { text-align:center; color:var(--text-muted); padding:16px; font-size:12px; }
+    .hdr-err-badge { font-size:10px; font-weight:800; padding:2px 8px; border-radius:999px; background:rgba(239,68,68,0.2); color:var(--danger); border:1px solid rgba(239,68,68,0.4); display:none; margin-right:8px; }
   </style>
 </head>
 <body>
@@ -1534,6 +1768,7 @@ INDEX_HTML = r"""<!doctype html>
       &middot;
       <span id="headerUpdated" style="font-size: 12px; color: var(--text-muted)">--</span>
     </div>
+    <span id="hdrErrBadge" class="hdr-err-badge"></span>
     <div id="statusBadge" class="status-badge">
       <div id="statusDot" class="status-dot"></div>
       <span id="statusText">DETECTING</span>
@@ -1664,6 +1899,20 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
 
+      <!-- Events & Logs -->
+      <div class="events-panel" id="eventsPanel">
+        <div class="events-panel-header" onclick="toggleEventsPanel()">
+          <span class="events-title">Events &amp; Logs</span>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span id="eventsBadge" class="events-err-badge"></span>
+            <span id="evToggleIcon" style="color:var(--text-muted);font-size:12px">&#9660;</span>
+          </div>
+        </div>
+        <div class="events-body" id="eventsBody">
+          <div class="events-empty-msg">No events yet.</div>
+        </div>
+      </div>
+
     </div><!-- /.main-content -->
   </div><!-- /.app-body -->
 
@@ -1685,6 +1934,8 @@ INDEX_HTML = r"""<!doctype html>
     let pendingAction = null;
     let lastUpdated = Date.now();
     let lastData = null;
+    let eventsPanelOpen = true;
+    let eventsLastCount = 0;
     let searchQuery = '';
     const history = { util: Array(60).fill(0), vram: Array(60).fill(0), tps: Array(60).fill(0) };
 
@@ -1940,6 +2191,9 @@ INDEX_HTML = r"""<!doctype html>
 
       // Sidebar
       buildSidebar(data);
+
+      // Events & Logs
+      updateEventsPanel(data);
     }
 
     function confirmSwitch(key, label) {
@@ -2041,6 +2295,33 @@ INDEX_HTML = r"""<!doctype html>
         document.getElementById('switchStatus').textContent = 'Error: ' + e.message;
       }
     };
+
+    function toggleEventsPanel() {
+      eventsPanelOpen = !eventsPanelOpen;
+      document.getElementById('eventsPanel').classList.toggle('events-collapsed', !eventsPanelOpen);
+      document.getElementById('evToggleIcon').textContent = eventsPanelOpen ? '▼' : '▶';
+    }
+
+    function updateEventsPanel(data) {
+      const events = data.log_events || [];
+      const errCnt = data.log_error_count || 0;
+      const hb = document.getElementById('hdrErrBadge');
+      if (hb) { hb.style.display = errCnt > 0 ? '' : 'none'; hb.textContent = `${errCnt} ERROR${errCnt !== 1 ? 'S' : ''}`; }
+      const pb = document.getElementById('eventsBadge');
+      if (pb) { pb.style.display = errCnt > 0 ? '' : 'none'; pb.textContent = `${errCnt} error${errCnt !== 1 ? 's' : ''}`; }
+      const body = document.getElementById('eventsBody');
+      if (!events.length) {
+        body.innerHTML = '<div class="events-empty-msg">No events yet.</div>';
+        eventsLastCount = 0; return;
+      }
+      const sorted = [...events].reverse();
+      body.innerHTML = sorted.map(e => {
+        const ts = fmtLocalTs(e.ts).replace(/^.*?,\s*/, '');
+        return `<div class="event-row"><span class="event-ts">${escHtml(ts)}</span><span class="event-sev ev-${e.severity}">${e.severity.toUpperCase()}</span><span class="event-msg">${escHtml(e.message)}</span></div>`;
+      }).join('');
+      if (events.length > eventsLastCount) body.scrollTop = 0;
+      eventsLastCount = events.length;
+    }
 
     async function refresh() {
       if (isRefreshing) return;
@@ -2304,6 +2585,8 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     if not SWITCH_SCRIPT.exists():
         raise SystemExit(f"Missing switch script: {SWITCH_SCRIPT}")
+
+    threading.Thread(target=_run_log_watcher, daemon=True, name="log-watcher").start()
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"dashboard server listening on {HOST}:{PORT}")

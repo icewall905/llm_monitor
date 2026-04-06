@@ -1981,6 +1981,15 @@ INDEX_HTML = r"""<!doctype html>
       qwen: 'QWEN', nemotron: 'NEMOTRON', gptoss: 'GPT-OSS',
       glm: 'GLM', mistral: 'MISTRAL', gemma: 'GEMMA', other: 'OTHER'
     };
+    // Persisted collapse state: key = family, value = true if collapsed
+    let FAMILY_COLLAPSED = {};
+    try { FAMILY_COLLAPSED = JSON.parse(localStorage.getItem('familyCollapsed') || '{}'); } catch(e) {}
+
+    function toggleFamily(fam) {
+      FAMILY_COLLAPSED[fam] = !FAMILY_COLLAPSED[fam];
+      try { localStorage.setItem('familyCollapsed', JSON.stringify(FAMILY_COLLAPSED)); } catch(e) {}
+      if (lastData) buildSidebar(lastData);
+    }
 
     function initChart() {
       const ctx = document.getElementById('historyChart').getContext('2d');
@@ -2038,8 +2047,11 @@ INDEX_HTML = r"""<!doctype html>
       let html = '';
       for (const fam of FAMILY_ORDER) {
         if (!groups[fam]) continue;
+        const collapsed = FAMILY_COLLAPSED[fam];
+        const chevron = collapsed ? '&#9658;' : '&#9660;';
         html += `<div class="family-group">
-          <div class="family-label">${FAMILY_LABELS[fam] || fam.toUpperCase()}</div>`;
+          <div class="family-label" onclick="toggleFamily('${fam}')" style="cursor:pointer;user-select:none;">${chevron}&nbsp;${FAMILY_LABELS[fam] || fam.toUpperCase()}</div>`;
+        if (!collapsed) {
         for (const m of groups[fam]) {
           const active = data.active?.key === m.key;
           const isTarget = switching && switchTarget === m.key;
@@ -2056,6 +2068,7 @@ INDEX_HTML = r"""<!doctype html>
               ${tags ? `<div class="model-tags">${tags}</div>` : ''}
             </div>
           </div>`;
+        }
         }
         html += '</div>';
       }

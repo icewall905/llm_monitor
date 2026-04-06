@@ -1976,7 +1976,7 @@ INDEX_HTML = r"""<!doctype html>
     const history = { util: Array(60).fill(0), vram: Array(60).fill(0), tps: Array(60).fill(0) };
 
     // Family display order for sidebar grouping
-    const FAMILY_ORDER = ['qwen','nemotron','gptoss','glm','mistral','gemma','other'];
+    const FAMILY_ORDER = ['gemma','gptoss','glm','mistral','nemotron','qwen','other'];
     const FAMILY_LABELS = {
       qwen: 'QWEN', nemotron: 'NEMOTRON', gptoss: 'GPT-OSS',
       glm: 'GLM', mistral: 'MISTRAL', gemma: 'GEMMA', other: 'OTHER'

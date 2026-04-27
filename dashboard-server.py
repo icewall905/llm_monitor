@@ -222,7 +222,7 @@ LIVE_TPS_STATE = {
 }
 
 # Live TPS cache for fast API responses
-LIVE_TPS_CACHE_TTL_SEC = float(os.environ.get("LIVE_TPS_CACHE_TTL_SEC", "0.5"))
+LIVE_TPS_CACHE_TTL_SEC = float(os.environ.get("LIVE_TPS_CACHE_TTL_SEC", "0.25"))
 LIVE_TPS_CACHE_LOCK = threading.Lock()
 LIVE_TPS_CACHE = {
     "active_key": None,
@@ -362,7 +362,7 @@ def _process_log_line(raw_line: str, active_key: str | None = None) -> None:
     m_n_tokens = SLOT_N_TOKENS_PATTERN.search(clean)
     if m_n_tokens:
         n_tokens = int(m_n_tokens.group(1))
-        if n_tokens > 0:
+        if n_tokens > 10:
             with CONTEXT_STATE_LOCK:
                 CONTEXT_STATE["n_tokens"] = n_tokens
                 if active_key:
@@ -1484,16 +1484,18 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
         # Prefer log-parsed prompt tokens (from "prompt processing done")
         # then fall back to n_tokens (from slot release/progress)
         base_tokens = ctx_state.get("n_prompt_tokens") or ctx_state.get("n_tokens")
+        # Only use log-based n_past during active generation or if we have decoded_tokens
+        # Idle values from tiny prompts are not representative
+        is_generating = live_throughput.get("state") in ("ok", "warming")
+        decoded = live_throughput.get("decoded_tokens") or 0
         if base_tokens is not None and ctx_state.get("active_key") == active_key:
-            # During active generation, add decoded tokens from /slots
-            decoded = live_throughput.get("decoded_tokens") or 0
-            computed_n_past = base_tokens + decoded
-            # Only use if it makes sense (larger than 0 or larger than what we had)
-            if computed_n_past > 0:
-                context_info["n_past"] = computed_n_past
-                with CONTEXT_STATE_LOCK:
-                    if computed_n_past > 10 and computed_n_past > (CONTEXT_STATE.get("last_good_n_past") or 0):
-                        CONTEXT_STATE["last_good_n_past"] = computed_n_past
+            if is_generating or decoded > 0:
+                computed_n_past = base_tokens + decoded
+                if computed_n_past > 10:
+                    context_info["n_past"] = computed_n_past
+                    with CONTEXT_STATE_LOCK:
+                        if computed_n_past > 10 and computed_n_past > (CONTEXT_STATE.get("last_good_n_past") or 0):
+                            CONTEXT_STATE["last_good_n_past"] = computed_n_past
     # If still None or tiny, use last known good value
     if (context_info["n_past"] is None or (isinstance(context_info["n_past"], int) and context_info["n_past"] < 10)):
         last_good = ctx_state.get("last_good_n_past")
@@ -2617,7 +2619,7 @@ INDEX_HTML = r"""<!doctype html>
 
     initChart();
     refresh();
-    setInterval(refresh, 1000);
+    setInterval(refresh, 500);
   </script>
 </body>
 </html>

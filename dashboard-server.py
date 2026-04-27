@@ -1481,9 +1481,10 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
         except ValueError:
             pass
     if context_info["n_past"] is None:
-        # Prefer log-parsed prompt tokens (from "prompt processing done")
-        # then fall back to n_tokens (from slot release/progress)
-        base_tokens = ctx_state.get("n_prompt_tokens") or ctx_state.get("n_tokens")
+        # Prefer task.n_tokens (arrives at start of processing, has full prompt size)
+        # then n_prompt_tokens (from "prompt processing done")
+        # then n_tokens (from slot release/progress)
+        base_tokens = ctx_state.get("task_n_tokens") or ctx_state.get("n_prompt_tokens") or ctx_state.get("n_tokens")
         # Only use log-based n_past during active generation or if we have decoded_tokens
         # Idle values from tiny prompts are not representative
         is_generating = live_throughput.get("state") in ("ok", "warming")

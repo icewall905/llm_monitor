@@ -118,8 +118,8 @@ SWITCH_POLL_SEC = float(os.environ.get("SWITCH_POLL_SEC", "5"))
 SWITCH_STALE_SEC = int(
     os.environ.get("SWITCH_STALE_SEC", str(max(SWITCH_READY_TIMEOUT_SEC + 120, 1020)))
 )
-THROUGHPUT_LOG_TAIL_LINES = int(os.environ.get("THROUGHPUT_LOG_TAIL_LINES", "300"))
-THROUGHPUT_CACHE_TTL_SEC = float(os.environ.get("THROUGHPUT_CACHE_TTL_SEC", "2"))
+THROUGHPUT_LOG_TAIL_LINES = int(os.environ.get("THROUGHPUT_LOG_TAIL_LINES", "500"))
+THROUGHPUT_CACHE_TTL_SEC = float(os.environ.get("THROUGHPUT_CACHE_TTL_SEC", "1"))
 BENCHMARK_TIMEOUT_SEC = int(os.environ.get("BENCHMARK_TIMEOUT_SEC", "180"))
 BENCHMARK_PROMPT_TOKENS = int(os.environ.get("BENCHMARK_PROMPT_TOKENS", "768"))
 BENCHMARK_N_PREDICT = int(os.environ.get("BENCHMARK_N_PREDICT", "256"))
@@ -2315,9 +2315,11 @@ INDEX_HTML = r"""<!doctype html>
       const stats = data.model_stats || {};
       const bench = data.benchmark || {};
 
-      // Quick stats - show live TPS (0 when idle)
+      // Quick stats - show live TPS, fall back to last completed when idle
       const liveTps = stats.live_tps || 0;
-      document.getElementById('val-tps').textContent = liveTps > 0 ? liveTps.toFixed(1) : '0.0';
+      const lastTps = stats.last_completed_tps || stats.live_average_tps || 0;
+      const genDisplay = liveTps > 0 ? liveTps.toFixed(1) : (lastTps > 0 ? lastTps.toFixed(1) : '0.0');
+      document.getElementById('val-tps').textContent = genDisplay;
 
       // Ingest Speed: prefer live ingest from /slots, fall back to best known
       let ingestVal = '0.0';

@@ -1485,18 +1485,13 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
         # then n_prompt_tokens (from "prompt processing done")
         # then n_tokens (from slot release/progress)
         base_tokens = ctx_state.get("task_n_tokens") or ctx_state.get("n_prompt_tokens") or ctx_state.get("n_tokens")
-        # Only use log-based n_past during active generation or if we have decoded_tokens
-        # Idle values from tiny prompts are not representative
-        is_generating = live_throughput.get("state") in ("ok", "warming")
         decoded = live_throughput.get("decoded_tokens") or 0
         if base_tokens is not None and ctx_state.get("active_key") == active_key:
-            if is_generating or decoded > 0:
-                computed_n_past = base_tokens + decoded
-                if computed_n_past > 10:
-                    context_info["n_past"] = computed_n_past
-                    with CONTEXT_STATE_LOCK:
-                        if computed_n_past > 10 and computed_n_past > (CONTEXT_STATE.get("last_good_n_past") or 0):
-                            CONTEXT_STATE["last_good_n_past"] = computed_n_past
+            computed_n_past = base_tokens + decoded
+            if computed_n_past > 10:
+                context_info["n_past"] = computed_n_past
+                with CONTEXT_STATE_LOCK:
+                    CONTEXT_STATE["last_good_n_past"] = computed_n_past
     # If still None or tiny, use last known good value
     if (context_info["n_past"] is None or (isinstance(context_info["n_past"], int) and context_info["n_past"] < 10)):
         last_good = ctx_state.get("last_good_n_past")

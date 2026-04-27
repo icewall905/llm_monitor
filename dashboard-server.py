@@ -251,7 +251,7 @@ EVAL_TPS_PATTERN = re.compile(
     r"eval time\s*=.*?\(\s*[0-9.]+\s+ms per token,\s*([0-9.]+)\s+tokens per second\)"
 )
 INGEST_TPS_PATTERN = re.compile(
-    r"prompt eval time\s*=.*?\(\s*[0-9.]+\s+ms per token,\s*([0-9.]+)\s+tokens per second\)"
+    r"prompt eval time\s*=\s*[0-9.]+\s*ms\s*/\s*([0-9]+)\s*tokens\s*\(.*?([0-9.]+)\s+tokens per second\)"
 )
 TIMING_TASK_PATTERN = re.compile(r"slot print_timing: id\s+\d+\s+\|\s+task\s+(\d+)\s+\|")
 SLOT_N_TOKENS_PATTERN = re.compile(
@@ -648,8 +648,9 @@ def parse_latest_completion(log_text: str) -> tuple[float | None, float | None, 
 
         ingest_match = INGEST_TPS_PATTERN.search(line)
         if ingest_match:
-            val = float(ingest_match.group(1))
-            if val < 20000: # Sanity check
+            n_tok = int(ingest_match.group(1))
+            val = float(ingest_match.group(2))
+            if n_tok > 10 and val < 20000:
                 latest_ingest_tps = val
                 latest_ingest_line = line.strip()
                 if line_ts_f: latest_ts_f = line_ts_f

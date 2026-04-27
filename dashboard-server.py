@@ -230,12 +230,12 @@ LIVE_TPS_CACHE = {
     "checked_at": 0.0,
     "result": None,
 }
-LIVE_INGEST_STATE_LOCK = threading.Lock()
-LIVE_INGEST_STATE = {
+INGEST_LIVE_STATE_LOCK = threading.Lock()
+INGEST_LIVE_STATE = {
     "active_key": None,
-    "container": None,
-    "sampled_at": 0.0,
-    "n_past": None,
+    "ingest_tps": None,
+    "ingest_start_ts": None,
+    "ingest_start_tokens": None,
 }
 CONTEXT_STATE_LOCK = threading.Lock()
 CONTEXT_STATE = {
@@ -351,14 +351,6 @@ def _process_log_line(raw_line: str, active_key: str | None = None) -> None:
     match = _LOG_TS_RE.search(raw_line)
     clean = _LOG_TS_RE.sub("", raw_line.strip(), count=1)
 
-    m_prompt_done = SLOT_PROMPT_DONE_PATTERN.search(clean)
-    if m_prompt_done:
-        n_tokens = int(m_prompt_done.group(1))
-        with CONTEXT_STATE_LOCK:
-            CONTEXT_STATE["n_prompt_tokens"] = n_tokens
-            if active_key:
-                CONTEXT_STATE["active_key"] = active_key
-
     m_n_tokens = SLOT_N_TOKENS_PATTERN.search(clean)
     if m_n_tokens:
         n_tokens = int(m_n_tokens.group(1))
@@ -379,6 +371,29 @@ def _process_log_line(raw_line: str, active_key: str | None = None) -> None:
         task_tokens = int(m_task_tokens.group(1))
         with CONTEXT_STATE_LOCK:
             CONTEXT_STATE["task_n_tokens"] = task_tokens
+        # Track start of prompt ingestion for live ingest TPS
+        with INGEST_LIVE_STATE_LOCK:
+            INGEST_LIVE_STATE["ingest_start_ts"] = time.time()
+            INGEST_LIVE_STATE["ingest_start_tokens"] = task_tokens
+            if active_key:
+                INGEST_LIVE_STATE["active_key"] = active_key
+
+    # When prompt processing finishes, compute ingest TPS
+    if m_prompt_done:
+        n_tokens = int(m_prompt_done.group(1))
+        with CONTEXT_STATE_LOCK:
+            CONTEXT_STATE["n_prompt_tokens"] = n_tokens
+            if active_key:
+                CONTEXT_STATE["active_key"] = active_key
+        with INGEST_LIVE_STATE_LOCK:
+            start_ts = INGEST_LIVE_STATE.get("ingest_start_ts")
+            start_tokens = INGEST_LIVE_STATE.get("ingest_start_tokens")
+            if start_ts is not None and start_tokens is not None and start_tokens > 0:
+                dt = time.time() - start_ts
+                if dt > 0.01 and n_tokens > start_tokens:
+                    INGEST_LIVE_STATE["ingest_tps"] = (n_tokens - 0) / dt
+                elif dt > 0.01:
+                    INGEST_LIVE_STATE["ingest_tps"] = n_tokens / dt
 
     for severity, category, pattern in _LOG_PATTERNS:
         if pattern.search(clean):
@@ -656,8 +671,7 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
         return {
             "tokens_per_second": None,
             "n_ctx": None,
-            "n_past": None,
-            "live_ingest_tps": None,
+            "decoded_tokens": None,
             "state": "error",
             "detail": "Failed to parse /slots response",
         }
@@ -666,8 +680,7 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
         return {
             "tokens_per_second": None,
             "n_ctx": None,
-            "n_past": None,
-            "live_ingest_tps": None,
+            "decoded_tokens": None,
             "state": "error",
             "detail": "Unexpected /slots format",
         }
@@ -675,19 +688,15 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
     processing = False
     decoded_tokens = 0
     n_ctx = None
-    n_past = None
     for slot in slots:
         if not isinstance(slot, dict):
             continue
         slot_n_ctx = slot.get("n_ctx")
-        slot_n_past = slot.get("n_past")
         if isinstance(slot_n_ctx, int) and (n_ctx is None or slot_n_ctx > n_ctx):
             n_ctx = slot_n_ctx
         if not slot.get("is_processing"):
             continue
         processing = True
-        if isinstance(slot_n_past, int):
-            n_past = max(n_past or 0, slot_n_past)
         next_tokens = slot.get("next_token")
         if not isinstance(next_tokens, list):
             continue
@@ -705,17 +714,10 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
             LIVE_TPS_STATE["container"] = container
             LIVE_TPS_STATE["sampled_at"] = now
             LIVE_TPS_STATE["decoded_tokens"] = None
-            with LIVE_INGEST_STATE_LOCK:
-                LIVE_INGEST_STATE["active_key"] = active_key
-                LIVE_INGEST_STATE["container"] = container
-                LIVE_INGEST_STATE["sampled_at"] = now
-                LIVE_INGEST_STATE["n_past"] = None
             return {
                 "tokens_per_second": 0.0,
                 "n_ctx": n_ctx,
-                "n_past": None,
-                "live_ingest_tps": None,
-                "decoded_tokens": decoded_tokens if processing else None,
+                "decoded_tokens": None,
                 "state": "idle",
                 "detail": "No active generation in /slots",
             }
@@ -738,30 +740,16 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
         LIVE_TPS_STATE["sampled_at"] = now
         LIVE_TPS_STATE["decoded_tokens"] = decoded_tokens
 
-    live_ingest_tps = None
-    with LIVE_INGEST_STATE_LOCK:
-        prev_valid_ingest = (
-            LIVE_INGEST_STATE["active_key"] == active_key
-            and LIVE_INGEST_STATE["container"] == container
-            and LIVE_INGEST_STATE["n_past"] is not None
-            and LIVE_INGEST_STATE["sampled_at"] > 0
-        )
-        if prev_valid_ingest and n_past is not None:
-            dt_ingest = now - float(LIVE_INGEST_STATE["sampled_at"])
-            prev_n_past = int(LIVE_INGEST_STATE["n_past"])
-            if dt_ingest > 0 and n_past > prev_n_past:
-                live_ingest_tps = (n_past - prev_n_past) / dt_ingest
-        LIVE_INGEST_STATE["active_key"] = active_key
-        LIVE_INGEST_STATE["container"] = container
-        LIVE_INGEST_STATE["sampled_at"] = now
-        LIVE_INGEST_STATE["n_past"] = n_past
+    # Reset ingest state on idle (already handled above, also reset on model switch)
+    with INGEST_LIVE_STATE_LOCK:
+        if not processing:
+            INGEST_LIVE_STATE["ingest_start_ts"] = None
+            INGEST_LIVE_STATE["ingest_start_tokens"] = None
 
     if live_tps is None:
         return {
             "tokens_per_second": None,
             "n_ctx": n_ctx,
-            "n_past": n_past,
-            "live_ingest_tps": live_ingest_tps,
             "decoded_tokens": decoded_tokens,
             "state": "warming",
             "detail": "Collecting live TPS sample",
@@ -769,8 +757,6 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
     return {
         "tokens_per_second": live_tps,
         "n_ctx": n_ctx,
-        "n_past": n_past,
-        "live_ingest_tps": live_ingest_tps,
         "decoded_tokens": decoded_tokens,
         "state": "ok",
         "detail": "Live decode throughput from /slots",
@@ -785,8 +771,6 @@ def fetch_live_tps(active_key: str | None, container: str) -> dict:
         return {
             "tokens_per_second": None,
             "n_ctx": None,
-            "n_past": None,
-            "live_ingest_tps": None,
             "decoded_tokens": None,
             "source": "slots",
             "updated_at": now_iso(),
@@ -799,8 +783,6 @@ def fetch_live_tps(active_key: str | None, container: str) -> dict:
     return {
         "tokens_per_second": parsed["tokens_per_second"],
         "n_ctx": parsed.get("n_ctx"),
-        "n_past": parsed.get("n_past"),
-        "live_ingest_tps": parsed.get("live_ingest_tps"),
         "decoded_tokens": parsed.get("decoded_tokens"),
         "source": "slots",
         "updated_at": now_iso(),
@@ -815,8 +797,6 @@ def build_live_throughput_status(active_key: str | None, containers: list[dict])
         return {
             "tokens_per_second": None,
             "n_ctx": None,
-            "n_past": None,
-            "live_ingest_tps": None,
             "decoded_tokens": None,
             "source": "slots",
             "updated_at": None,
@@ -830,8 +810,6 @@ def build_live_throughput_status(active_key: str | None, containers: list[dict])
         return {
             "tokens_per_second": None,
             "n_ctx": None,
-            "n_past": None,
-            "live_ingest_tps": None,
             "decoded_tokens": None,
             "source": "slots",
             "updated_at": None,
@@ -974,6 +952,8 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
     now = now_iso()
     with MODEL_STATS_LOCK:
         if MODEL_STATS["active_key"] != active_key or MODEL_STATS["stats"] is None:
+            with INGEST_LIVE_STATE_LOCK:
+                INGEST_LIVE_STATE.update({"ingest_tps": 0.0, "ingest_start_ts": None, "ingest_start_tokens": None, "active_key": None})
             MODEL_STATS["active_key"] = active_key
             MODEL_STATS["stats"] = {
                 "model_key": active_key,
@@ -1010,11 +990,14 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
             stats["live_samples"] += 1
             stats["live_average_tps"] = stats["live_sum"] / stats["live_samples"]
 
-        live_ingest = live.get("live_ingest_tps")
-        if isinstance(live_ingest, (int, float)) and live_ingest > 0:
-            stats["last_live_ingest_tps"] = float(live_ingest)
-            if stats["best_ingest_tps"] is None or float(live_ingest) > stats["best_ingest_tps"]:
-                stats["best_ingest_tps"] = float(live_ingest)
+        # Check log-watcher-based live ingest from INGEST_LIVE_STATE
+        with INGEST_LIVE_STATE_LOCK:
+            ingest_live_tps = INGEST_LIVE_STATE.get("ingest_tps")
+            ingest_active_key = INGEST_LIVE_STATE.get("active_key")
+        if ingest_active_key == active_key and isinstance(ingest_live_tps, (int, float)) and ingest_live_tps > 0:
+            stats["last_live_ingest_tps"] = float(ingest_live_tps)
+            if stats["best_ingest_tps"] is None or float(ingest_live_tps) > stats["best_ingest_tps"]:
+                stats["best_ingest_tps"] = float(ingest_live_tps)
 
         completion_tps = completed.get("tokens_per_second")
         completion_ingest = completed.get("ingest_tps")
@@ -1027,16 +1010,17 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
         )
         if should_add_completion:
             stats["last_completed_tps"] = float(completion_tps)
-            if isinstance(completion_ingest, (int, float)):
-                stats["last_ingest_tps"] = float(completion_ingest)
-                if stats["best_ingest_tps"] is None or float(completion_ingest) > stats["best_ingest_tps"]:
-                    stats["best_ingest_tps"] = float(completion_ingest)
             stats["last_completed_at"] = now
             stats["last_completed_at_f"] = completed.get("ts_f")
             stats["last_completed_completion_key"] = completion_key
             stats["completed_count"] += 1
             stats["completed_sum_tps"] += float(completion_tps)
             stats["average_rate_tps"] = stats["completed_sum_tps"] / stats["completed_count"]
+        # Always update ingest from completions, even for dup keys
+        if isinstance(completion_ingest, (int, float)) and completion_ingest > 0:
+            stats["last_ingest_tps"] = float(completion_ingest)
+            if stats["best_ingest_tps"] is None or float(completion_ingest) > stats["best_ingest_tps"]:
+                stats["best_ingest_tps"] = float(completion_ingest)
 
         return {
             "model_key": stats["model_key"],
@@ -2317,12 +2301,15 @@ INDEX_HTML = r"""<!doctype html>
       const genDisplay = liveTps > 0 ? liveTps.toFixed(1) : (lastTps > 0 ? lastTps.toFixed(1) : '0.0');
       document.getElementById('val-tps').textContent = genDisplay;
 
-      // Ingest Speed: prefer live ingest from /slots, fall back to best known
+      // Ingest Speed: prefer live ingest (log timestamps), then last completed, then best
       let ingestVal = '0.0';
-      const liveIngest = stats.last_live_ingest_tps || data.live_throughput?.live_ingest_tps;
+      const liveIngest = stats.last_live_ingest_tps;
+      const lastIngest = stats.last_ingest_tps;
       const bestIngest = stats.best_ingest_tps;
       if (liveIngest != null && liveIngest > 0) {
         ingestVal = liveIngest.toFixed(1);
+      } else if (lastIngest != null && lastIngest > 0) {
+        ingestVal = lastIngest.toFixed(1);
       } else if (bestIngest != null && bestIngest > 0) {
         ingestVal = bestIngest.toFixed(1);
       }

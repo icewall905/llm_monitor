@@ -2016,6 +2016,11 @@ INDEX_HTML = r"""<!doctype html>
           <div class="stat-sub">tokens / sec</div>
         </div>
         <div class="stat-card">
+          <div class="stat-label">Context</div>
+          <div class="stat-value" id="val-ctx">-- / --</div>
+          <div class="stat-bar-bg"><div id="bar-ctx" class="stat-bar-fill" style="width:0%"></div></div>
+        </div>
+        <div class="stat-card">
           <div class="stat-label">GPU Utilization</div>
           <div class="stat-value" id="val-util">--%</div>
           <div class="stat-bar-bg"><div id="bar-util" class="stat-bar-fill" style="width:0%"></div></div>
@@ -2029,11 +2034,6 @@ INDEX_HTML = r"""<!doctype html>
           <div class="stat-label">Temperature</div>
           <div class="stat-value" id="val-temp">--&deg;C</div>
           <div class="stat-sub" id="val-fan">Fan: --%</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Context</div>
-          <div class="stat-value" id="val-ctx">-- / --</div>
-          <div class="stat-bar-bg"><div id="bar-ctx" class="stat-bar-fill" style="width:0%"></div></div>
         </div>
       </div>
 

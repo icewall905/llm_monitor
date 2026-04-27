@@ -230,6 +230,13 @@ LIVE_TPS_CACHE = {
     "checked_at": 0.0,
     "result": None,
 }
+LIVE_INGEST_STATE_LOCK = threading.Lock()
+LIVE_INGEST_STATE = {
+    "active_key": None,
+    "container": None,
+    "sampled_at": 0.0,
+    "n_past": None,
+}
 
 EVAL_TPS_PATTERN = re.compile(
     r"eval time\s*=.*?\(\s*[0-9.]+\s+ms per token,\s*([0-9.]+)\s+tokens per second\)"
@@ -600,6 +607,9 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
     except Exception:
         return {
             "tokens_per_second": None,
+            "n_ctx": None,
+            "n_past": None,
+            "live_ingest_tps": None,
             "state": "error",
             "detail": "Failed to parse /slots response",
         }
@@ -607,16 +617,29 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
     if not isinstance(slots, list):
         return {
             "tokens_per_second": None,
+            "n_ctx": None,
+            "n_past": None,
+            "live_ingest_tps": None,
             "state": "error",
             "detail": "Unexpected /slots format",
         }
 
     processing = False
     decoded_tokens = 0
+    n_ctx = None
+    n_past = None
     for slot in slots:
-        if not isinstance(slot, dict) or not slot.get("is_processing"):
+        if not isinstance(slot, dict):
+            continue
+        slot_n_ctx = slot.get("n_ctx")
+        slot_n_past = slot.get("n_past")
+        if isinstance(slot_n_ctx, int) and (n_ctx is None or slot_n_ctx > n_ctx):
+            n_ctx = slot_n_ctx
+        if not slot.get("is_processing"):
             continue
         processing = True
+        if isinstance(slot_n_past, int):
+            n_past = max(n_past or 0, slot_n_past)
         next_tokens = slot.get("next_token")
         if not isinstance(next_tokens, list):
             continue
@@ -634,8 +657,16 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
             LIVE_TPS_STATE["container"] = container
             LIVE_TPS_STATE["sampled_at"] = now
             LIVE_TPS_STATE["decoded_tokens"] = None
+            with LIVE_INGEST_STATE_LOCK:
+                LIVE_INGEST_STATE["active_key"] = active_key
+                LIVE_INGEST_STATE["container"] = container
+                LIVE_INGEST_STATE["sampled_at"] = now
+                LIVE_INGEST_STATE["n_past"] = None
             return {
                 "tokens_per_second": 0.0,
+                "n_ctx": n_ctx,
+                "n_past": None,
+                "live_ingest_tps": None,
                 "state": "idle",
                 "detail": "No active generation in /slots",
             }
@@ -658,14 +689,38 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
         LIVE_TPS_STATE["sampled_at"] = now
         LIVE_TPS_STATE["decoded_tokens"] = decoded_tokens
 
+    live_ingest_tps = None
+    with LIVE_INGEST_STATE_LOCK:
+        prev_valid_ingest = (
+            LIVE_INGEST_STATE["active_key"] == active_key
+            and LIVE_INGEST_STATE["container"] == container
+            and LIVE_INGEST_STATE["n_past"] is not None
+            and LIVE_INGEST_STATE["sampled_at"] > 0
+        )
+        if prev_valid_ingest and n_past is not None:
+            dt_ingest = now - float(LIVE_INGEST_STATE["sampled_at"])
+            prev_n_past = int(LIVE_INGEST_STATE["n_past"])
+            if dt_ingest > 0 and n_past > prev_n_past:
+                live_ingest_tps = (n_past - prev_n_past) / dt_ingest
+        LIVE_INGEST_STATE["active_key"] = active_key
+        LIVE_INGEST_STATE["container"] = container
+        LIVE_INGEST_STATE["sampled_at"] = now
+        LIVE_INGEST_STATE["n_past"] = n_past
+
     if live_tps is None:
         return {
             "tokens_per_second": None,
+            "n_ctx": n_ctx,
+            "n_past": n_past,
+            "live_ingest_tps": live_ingest_tps,
             "state": "warming",
             "detail": "Collecting live TPS sample",
         }
     return {
         "tokens_per_second": live_tps,
+        "n_ctx": n_ctx,
+        "n_past": n_past,
+        "live_ingest_tps": live_ingest_tps,
         "state": "ok",
         "detail": "Live decode throughput from /slots",
     }
@@ -678,6 +733,9 @@ def fetch_live_tps(active_key: str | None, container: str) -> dict:
     if code != 0:
         return {
             "tokens_per_second": None,
+            "n_ctx": None,
+            "n_past": None,
+            "live_ingest_tps": None,
             "source": "slots",
             "updated_at": now_iso(),
             "container": container,
@@ -688,6 +746,9 @@ def fetch_live_tps(active_key: str | None, container: str) -> dict:
     parsed = parse_live_tps_from_slots(output, active_key, container)
     return {
         "tokens_per_second": parsed["tokens_per_second"],
+        "n_ctx": parsed.get("n_ctx"),
+        "n_past": parsed.get("n_past"),
+        "live_ingest_tps": parsed.get("live_ingest_tps"),
         "source": "slots",
         "updated_at": now_iso(),
         "container": container,
@@ -700,6 +761,9 @@ def build_live_throughput_status(active_key: str | None, containers: list[dict])
     if not active_key:
         return {
             "tokens_per_second": None,
+            "n_ctx": None,
+            "n_past": None,
+            "live_ingest_tps": None,
             "source": "slots",
             "updated_at": None,
             "container": None,
@@ -711,6 +775,9 @@ def build_live_throughput_status(active_key: str | None, containers: list[dict])
     if not container:
         return {
             "tokens_per_second": None,
+            "n_ctx": None,
+            "n_past": None,
+            "live_ingest_tps": None,
             "source": "slots",
             "updated_at": None,
             "container": None,
@@ -841,6 +908,8 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
             "live_average_tps": None,
             "last_completed_tps": None,
             "last_ingest_tps": None,
+            "last_live_ingest_tps": None,
+            "best_ingest_tps": None,
             "last_completed_at": None,
             "last_completed_at_f": None,
             "completed_count": 0,
@@ -861,6 +930,8 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
                 "live_average_tps": None,
                 "last_completed_tps": None,
                 "last_ingest_tps": None,
+                "last_live_ingest_tps": None,
+                "best_ingest_tps": None,
                 "last_completed_at": None,
                 "last_completed_at_f": None,
                 "last_completed_completion_key": None,
@@ -884,6 +955,12 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
             stats["live_samples"] += 1
             stats["live_average_tps"] = stats["live_sum"] / stats["live_samples"]
 
+        live_ingest = live.get("live_ingest_tps")
+        if isinstance(live_ingest, (int, float)) and live_ingest > 0:
+            stats["last_live_ingest_tps"] = float(live_ingest)
+            if stats["best_ingest_tps"] is None or float(live_ingest) > stats["best_ingest_tps"]:
+                stats["best_ingest_tps"] = float(live_ingest)
+
         completion_tps = completed.get("tokens_per_second")
         completion_ingest = completed.get("ingest_tps")
         completion_key = completed.get("completion_key")
@@ -897,6 +974,8 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
             stats["last_completed_tps"] = float(completion_tps)
             if isinstance(completion_ingest, (int, float)):
                 stats["last_ingest_tps"] = float(completion_ingest)
+                if stats["best_ingest_tps"] is None or float(completion_ingest) > stats["best_ingest_tps"]:
+                    stats["best_ingest_tps"] = float(completion_ingest)
             stats["last_completed_at"] = now
             stats["last_completed_at_f"] = completed.get("ts_f")
             stats["last_completed_completion_key"] = completion_key
@@ -912,6 +991,8 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
             "live_average_tps": stats["live_average_tps"],
             "last_completed_tps": stats["last_completed_tps"],
             "last_ingest_tps": stats["last_ingest_tps"],
+            "last_live_ingest_tps": stats["last_live_ingest_tps"],
+            "best_ingest_tps": stats["best_ingest_tps"],
             "last_completed_at": stats["last_completed_at"],
             "last_completed_at_f": stats["last_completed_at_f"],
             "completed_count": stats["completed_count"],
@@ -1322,6 +1403,18 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
     live_throughput = build_live_throughput_status(active_key, containers)
     model_stats = build_model_stats(active_key, live_throughput, throughput)
 
+    context_info = {"n_ctx": None, "n_past": None}
+    if live_throughput.get("n_ctx") is not None:
+        context_info["n_ctx"] = live_throughput["n_ctx"]
+    if live_throughput.get("n_past") is not None:
+        context_info["n_past"] = live_throughput["n_past"]
+    if context_info["n_ctx"] is None and active_key and active_key in models:
+        ctx_str = models[active_key].get("ctx_size", "")
+        try:
+            context_info["n_ctx"] = int(ctx_str) if ctx_str else None
+        except ValueError:
+            pass
+
     # Safety valve: clear stale benchmark runs that never flipped state (e.g. worker crash).
     with BENCHMARK_LOCK:
         if BENCHMARK_STATE["in_progress"]:
@@ -1355,6 +1448,7 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
         "throughput": throughput,
         "live_throughput": live_throughput,
         "model_stats": model_stats,
+        "context_info": context_info,
         "benchmark": benchmark,
         "switch_in_progress": snapshot["switch_in_progress"],
         "last_requested_model": snapshot["last_requested_model"],
@@ -1651,7 +1745,7 @@ INDEX_HTML = r"""<!doctype html>
     /* ── Quick stats ── */
     .stats-row {
       display: grid;
-      grid-template-columns: repeat(5, 1fr);
+      grid-template-columns: repeat(6, 1fr);
       gap: 14px;
     }
     .stat-card {
@@ -1762,10 +1856,10 @@ INDEX_HTML = r"""<!doctype html>
       .info-panel { order: 2; }
     }
     @media (max-width: 900px) {
-      .stats-row { grid-template-columns: repeat(2, 1fr); }
+      .stats-row { grid-template-columns: repeat(3, 1fr); }
     }
     @media (max-width: 600px) {
-      .stats-row { grid-template-columns: 1fr 1fr; }
+      .stats-row { grid-template-columns: repeat(2, 1fr); }
       .sidebar { display: none; }
     }
 
@@ -1852,6 +1946,11 @@ INDEX_HTML = r"""<!doctype html>
           <div class="stat-label">Temperature</div>
           <div class="stat-value" id="val-temp">--&deg;C</div>
           <div class="stat-sub" id="val-fan">Fan: --%</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Context</div>
+          <div class="stat-value" id="val-ctx">-- / --</div>
+          <div class="stat-bar-bg"><div id="bar-ctx" class="stat-bar-fill" style="width:0%"></div></div>
         </div>
       </div>
 
@@ -2133,13 +2232,14 @@ INDEX_HTML = r"""<!doctype html>
       const liveTps = stats.live_tps || 0;
       document.getElementById('val-tps').textContent = liveTps > 0 ? liveTps.toFixed(1) : '0.0';
 
-      // Ingest Speed Logic: Show 0 until first run, then keep for 10 seconds.
+      // Ingest Speed: prefer live ingest from /slots, fall back to best known
       let ingestVal = '0.0';
-      if (stats.last_ingest_tps != null && stats.last_completed_at_f != null) {
-        const ageSec = (Date.now() / 1000) - stats.last_completed_at_f;
-        if (ageSec < 10) {
-          ingestVal = stats.last_ingest_tps.toFixed(1);
-        }
+      const liveIngest = stats.last_live_ingest_tps || data.live_throughput?.live_ingest_tps;
+      const bestIngest = stats.best_ingest_tps;
+      if (liveIngest != null && liveIngest > 0) {
+        ingestVal = liveIngest.toFixed(1);
+      } else if (bestIngest != null && bestIngest > 0) {
+        ingestVal = bestIngest.toFixed(1);
       }
       document.getElementById('val-ingest').textContent = ingestVal;
       document.getElementById('val-util').textContent = gpu.util != null ? `${gpu.util}%` : '--%';
@@ -2150,6 +2250,32 @@ INDEX_HTML = r"""<!doctype html>
       document.getElementById('bar-vram').style.width = `${vramPct.toFixed(1)}%`;
       document.getElementById('val-temp').textContent = gpu.temp != null ? `${gpu.temp}°C` : '--°C';
       document.getElementById('val-fan').textContent = `Fan: ${gpu.fan || 0}%`;
+
+      // Context usage
+      const ctxInfo = data.context_info || {};
+      const nCtx = ctxInfo.n_ctx;
+      const nPast = ctxInfo.n_past;
+      const ctxEl = document.getElementById('val-ctx');
+      const ctxBar = document.getElementById('bar-ctx');
+      if (nCtx != null) {
+        const ctxMax = nCtx >= 1024 ? `${Math.round(nCtx/1024)}k` : `${nCtx}`;
+        if (nPast != null && nPast > 0) {
+          const ctxUsed = nPast >= 1024 ? `${(nPast/1024).toFixed(1)}k` : `${nPast}`;
+          ctxEl.textContent = `${ctxUsed} / ${ctxMax}`;
+          const pct = (nPast / nCtx) * 100;
+          ctxBar.style.width = `${pct.toFixed(1)}%`;
+          if (pct > 90) ctxBar.style.background = 'var(--danger)';
+          else if (pct > 70) ctxBar.style.background = 'var(--warning)';
+          else ctxBar.style.background = 'var(--accent)';
+        } else {
+          ctxEl.textContent = `0 / ${ctxMax}`;
+          ctxBar.style.width = '0%';
+          ctxBar.style.background = 'var(--accent)';
+        }
+      } else {
+        ctxEl.textContent = '-- / --';
+        ctxBar.style.width = '0%';
+      }
 
       // History chart - show live TPS (0 when idle) and last ingest
       const tpsVal = (stats && stats.live_tps) || 0;

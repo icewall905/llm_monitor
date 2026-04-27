@@ -237,6 +237,15 @@ LIVE_INGEST_STATE = {
     "sampled_at": 0.0,
     "n_past": None,
 }
+CONTEXT_STATE_LOCK = threading.Lock()
+CONTEXT_STATE = {
+    "active_key": None,
+    "n_tokens": None,
+    "n_ctx_slot": None,
+    "n_prompt_tokens": None,
+    "task_n_tokens": None,
+    "last_good_n_past": None,
+}
 
 EVAL_TPS_PATTERN = re.compile(
     r"eval time\s*=.*?\(\s*[0-9.]+\s+ms per token,\s*([0-9.]+)\s+tokens per second\)"
@@ -245,6 +254,16 @@ INGEST_TPS_PATTERN = re.compile(
     r"prompt eval time\s*=.*?\(\s*[0-9.]+\s+ms per token,\s*([0-9.]+)\s+tokens per second\)"
 )
 TIMING_TASK_PATTERN = re.compile(r"slot print_timing: id\s+\d+\s+\|\s+task\s+(\d+)\s+\|")
+SLOT_N_TOKENS_PATTERN = re.compile(
+    r"slot\s+(?:update_slots|release|load):\s+id\s+\d+\s+\|\s+task\s+\d+\s+\|\s+.*n_tokens\s*=\s*(\d+)"
+)
+SLOT_N_CTX_PATTERN = re.compile(r"n_ctx_slot\s*=\s*(\d+)")
+SLOT_PROMPT_DONE_PATTERN = re.compile(
+    r"slot update_slots:.*prompt processing done.*n_tokens\s*=\s*(\d+)"
+)
+SLOT_TASK_TOKENS_PATTERN = re.compile(
+    r"slot update_slots:.*task\.n_tokens\s*=\s*(\d+)"
+)
 _LOG_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\s+")
 _LOG_PATTERNS = [
     ("error",   "oom",        re.compile(r"CUDA error: out of memory|cudaMalloc failed|not enough memory|CUDA_ERROR_OUT_OF_MEMORY", re.I)),
@@ -328,10 +347,39 @@ def _has_recent_event(category: str, within_sec: float = 60.0) -> bool:
     return False
 
 
-def _process_log_line(raw_line: str) -> None:
+def _process_log_line(raw_line: str, active_key: str | None = None) -> None:
     match = _LOG_TS_RE.search(raw_line)
-    ts_iso = match.group(0).strip() if match else None
     clean = _LOG_TS_RE.sub("", raw_line.strip(), count=1)
+
+    m_prompt_done = SLOT_PROMPT_DONE_PATTERN.search(clean)
+    if m_prompt_done:
+        n_tokens = int(m_prompt_done.group(1))
+        with CONTEXT_STATE_LOCK:
+            CONTEXT_STATE["n_prompt_tokens"] = n_tokens
+            if active_key:
+                CONTEXT_STATE["active_key"] = active_key
+
+    m_n_tokens = SLOT_N_TOKENS_PATTERN.search(clean)
+    if m_n_tokens:
+        n_tokens = int(m_n_tokens.group(1))
+        if n_tokens > 0:
+            with CONTEXT_STATE_LOCK:
+                CONTEXT_STATE["n_tokens"] = n_tokens
+                if active_key:
+                    CONTEXT_STATE["active_key"] = active_key
+
+    m_n_ctx = SLOT_N_CTX_PATTERN.search(clean)
+    if m_n_ctx:
+        n_ctx = int(m_n_ctx.group(1))
+        with CONTEXT_STATE_LOCK:
+            CONTEXT_STATE["n_ctx_slot"] = n_ctx
+
+    m_task_tokens = SLOT_TASK_TOKENS_PATTERN.search(clean)
+    if m_task_tokens:
+        task_tokens = int(m_task_tokens.group(1))
+        with CONTEXT_STATE_LOCK:
+            CONTEXT_STATE["task_n_tokens"] = task_tokens
+
     for severity, category, pattern in _LOG_PATTERNS:
         if pattern.search(clean):
             _append_log_event(severity, category, clean)
@@ -365,11 +413,11 @@ def _check_restart_count(container: str) -> None:
         )
 
 
-def _ingest_log_tail(container: str, tail: int = 50) -> None:
+def _ingest_log_tail(container: str, tail: int = 50, active_key: str | None = None) -> None:
     code, output = run_command(["docker", "logs", "--tail", str(tail), container])
     if code == 0:
         for line in output.splitlines():
-            _process_log_line(line)
+            _process_log_line(line, active_key)
 
 
 def run_command(cmd: list[str]) -> tuple[int, str]:
@@ -419,7 +467,7 @@ def _run_log_watcher() -> None:
                     except Exception:
                         pass
                     proc = None
-                _ingest_log_tail(target, tail=50)
+                _ingest_log_tail(target, tail=50, active_key=active_key)
                 proc = subprocess.Popen(
                     ["docker", "logs", "--follow", "--tail", "0", "--timestamps", target],
                     stdout=subprocess.PIPE,
@@ -445,7 +493,7 @@ def _run_log_watcher() -> None:
                     line = proc.stdout.readline()
                     if not line:
                         break
-                    _process_log_line(line)
+                    _process_log_line(line, active_key)
                     count += 1
                 if proc.poll() is not None:
                     proc = None
@@ -667,6 +715,7 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
                 "n_ctx": n_ctx,
                 "n_past": None,
                 "live_ingest_tps": None,
+                "decoded_tokens": decoded_tokens if processing else None,
                 "state": "idle",
                 "detail": "No active generation in /slots",
             }
@@ -713,6 +762,7 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
             "n_ctx": n_ctx,
             "n_past": n_past,
             "live_ingest_tps": live_ingest_tps,
+            "decoded_tokens": decoded_tokens,
             "state": "warming",
             "detail": "Collecting live TPS sample",
         }
@@ -721,6 +771,7 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
         "n_ctx": n_ctx,
         "n_past": n_past,
         "live_ingest_tps": live_ingest_tps,
+        "decoded_tokens": decoded_tokens,
         "state": "ok",
         "detail": "Live decode throughput from /slots",
     }
@@ -736,6 +787,7 @@ def fetch_live_tps(active_key: str | None, container: str) -> dict:
             "n_ctx": None,
             "n_past": None,
             "live_ingest_tps": None,
+            "decoded_tokens": None,
             "source": "slots",
             "updated_at": now_iso(),
             "container": container,
@@ -749,6 +801,7 @@ def fetch_live_tps(active_key: str | None, container: str) -> dict:
         "n_ctx": parsed.get("n_ctx"),
         "n_past": parsed.get("n_past"),
         "live_ingest_tps": parsed.get("live_ingest_tps"),
+        "decoded_tokens": parsed.get("decoded_tokens"),
         "source": "slots",
         "updated_at": now_iso(),
         "container": container,
@@ -764,6 +817,7 @@ def build_live_throughput_status(active_key: str | None, containers: list[dict])
             "n_ctx": None,
             "n_past": None,
             "live_ingest_tps": None,
+            "decoded_tokens": None,
             "source": "slots",
             "updated_at": None,
             "container": None,
@@ -778,6 +832,7 @@ def build_live_throughput_status(active_key: str | None, containers: list[dict])
             "n_ctx": None,
             "n_past": None,
             "live_ingest_tps": None,
+            "decoded_tokens": None,
             "source": "slots",
             "updated_at": None,
             "container": None,
@@ -1404,16 +1459,46 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
     model_stats = build_model_stats(active_key, live_throughput, throughput)
 
     context_info = {"n_ctx": None, "n_past": None}
+    with CONTEXT_STATE_LOCK:
+        ctx_state = dict(CONTEXT_STATE)
+        # Reset stale context if model changed
+        if ctx_state.get("active_key") and ctx_state["active_key"] != active_key:
+            CONTEXT_STATE["n_tokens"] = None
+            CONTEXT_STATE["n_prompt_tokens"] = None
+            CONTEXT_STATE["task_n_tokens"] = None
+            CONTEXT_STATE["last_good_n_past"] = None
+            ctx_state.update({"n_tokens": None, "n_prompt_tokens": None, "task_n_tokens": None, "last_good_n_past": None})
     if live_throughput.get("n_ctx") is not None:
         context_info["n_ctx"] = live_throughput["n_ctx"]
     if live_throughput.get("n_past") is not None:
         context_info["n_past"] = live_throughput["n_past"]
+    if context_info["n_ctx"] is None and ctx_state.get("n_ctx_slot") is not None:
+        context_info["n_ctx"] = ctx_state["n_ctx_slot"]
     if context_info["n_ctx"] is None and active_key and active_key in models:
         ctx_str = models[active_key].get("ctx_size", "")
         try:
             context_info["n_ctx"] = int(ctx_str) if ctx_str else None
         except ValueError:
             pass
+    if context_info["n_past"] is None:
+        # Prefer log-parsed prompt tokens (from "prompt processing done")
+        # then fall back to n_tokens (from slot release/progress)
+        base_tokens = ctx_state.get("n_prompt_tokens") or ctx_state.get("n_tokens")
+        if base_tokens is not None and ctx_state.get("active_key") == active_key:
+            # During active generation, add decoded tokens from /slots
+            decoded = live_throughput.get("decoded_tokens") or 0
+            computed_n_past = base_tokens + decoded
+            # Only use if it makes sense (larger than 0 or larger than what we had)
+            if computed_n_past > 0:
+                context_info["n_past"] = computed_n_past
+                with CONTEXT_STATE_LOCK:
+                    if computed_n_past > 10 and computed_n_past > (CONTEXT_STATE.get("last_good_n_past") or 0):
+                        CONTEXT_STATE["last_good_n_past"] = computed_n_past
+    # If still None or tiny, use last known good value
+    if (context_info["n_past"] is None or (isinstance(context_info["n_past"], int) and context_info["n_past"] < 10)):
+        last_good = ctx_state.get("last_good_n_past")
+        if last_good is not None and last_good >= 10:
+            context_info["n_past"] = last_good
 
     # Safety valve: clear stale benchmark runs that never flipped state (e.g. worker crash).
     with BENCHMARK_LOCK:

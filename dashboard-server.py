@@ -394,6 +394,8 @@ def _process_log_line(raw_line: str, active_key: str | None = None) -> None:
                     INGEST_LIVE_STATE["ingest_tps"] = (n_tokens - 0) / dt
                 elif dt > 0.01:
                     INGEST_LIVE_STATE["ingest_tps"] = n_tokens / dt
+            INGEST_LIVE_STATE["ingest_start_ts"] = None
+            INGEST_LIVE_STATE["ingest_start_tokens"] = None
 
     for severity, category, pattern in _LOG_PATTERNS:
         if pattern.search(clean):
@@ -2301,17 +2303,20 @@ INDEX_HTML = r"""<!doctype html>
       const genDisplay = liveTps > 0 ? liveTps.toFixed(1) : (lastTps > 0 ? lastTps.toFixed(1) : '0.0');
       document.getElementById('val-tps').textContent = genDisplay;
 
-      // Ingest Speed: prefer live ingest (log timestamps), then last completed, then best
+      // Ingest Speed: prefer completed (prompt eval time), then live during active prefill, then best
       let ingestVal = '0.0';
-      const liveIngest = stats.last_live_ingest_tps;
       const lastIngest = stats.last_ingest_tps;
+      const liveIngest = stats.last_live_ingest_tps;
       const bestIngest = stats.best_ingest_tps;
-      if (liveIngest != null && liveIngest > 0) {
-        ingestVal = liveIngest.toFixed(1);
-      } else if (lastIngest != null && lastIngest > 0) {
+      const isActivelyIngesting = data.live_throughput?.state !== 'idle' && liveIngest != null && liveIngest > 0;
+      if (lastIngest != null && lastIngest > 0) {
         ingestVal = lastIngest.toFixed(1);
+      } else if (isActivelyIngesting) {
+        ingestVal = liveIngest.toFixed(1);
       } else if (bestIngest != null && bestIngest > 0) {
         ingestVal = bestIngest.toFixed(1);
+      } else if (liveIngest != null && liveIngest > 0) {
+        ingestVal = liveIngest.toFixed(1);
       }
       document.getElementById('val-ingest').textContent = ingestVal;
       document.getElementById('val-util').textContent = gpu.util != null ? `${gpu.util}%` : '--%';

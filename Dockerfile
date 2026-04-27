@@ -18,7 +18,6 @@ COPY launch-monitor.sh /usr/local/bin/launch-monitor.sh
 COPY switch-llm.sh /gpu-monitor/switch-llm.sh
 COPY start-services.sh /usr/local/bin/start-services.sh
 COPY dashboard-server.py /usr/local/bin/dashboard-server.py
-COPY config.yaml /etc/gpu-monitor/config.yaml
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY btop.conf /tmp/btop.conf
 RUN mkdir -p /gpu-monitor /root/.config/btop && \

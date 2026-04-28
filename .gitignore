@@ -9,4 +9,8 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 .env
+config.yaml
 config.local.yaml
+.claude/
+.playwright-mcp/
+dashboard-check.png

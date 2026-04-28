@@ -129,6 +129,7 @@ BENCHMARK_STALE_SEC = int(
 )
 LOG_MAX_EVENTS = int(os.environ.get("LOG_MAX_EVENTS", "100"))
 LOG_WATCHER_INTERVAL_SEC = float(os.environ.get("LOG_WATCHER_INTERVAL_SEC", "2.0"))
+HEARTBEAT_INTERVAL_SEC = float(os.environ.get("HEARTBEAT_INTERVAL_SEC", "30.0"))
 RESTART_LOOP_THRESHOLD = 3
 RESTART_LOOP_WINDOW_SEC = 300.0
 
@@ -347,6 +348,57 @@ def _has_recent_event(category: str, within_sec: float = 60.0) -> bool:
     return False
 
 
+def _human_readable_path(path: str, body: dict | None = None) -> str:
+    if path == "/api/switch":
+        model = (body or {}).get("model", "?")
+        return f"Model switch to {model}"
+    if path == "/api/stop":
+        return "Stop all models"
+    if path == "/api/restart":
+        return "Restart active model"
+    if path == "/api/benchmark":
+        profile = (body or {}).get("profile", "balanced")
+        return f"Run {profile} benchmark"
+    if path == "/api/reset":
+        return "Emergency reset state"
+    if path in ("/api/status",):
+        return "Status poll"
+    if path in ("/", "/index.html"):
+        return "Dashboard page"
+    return path
+
+
+def _build_heartbeat_summary(active_key: str, containers: list[dict]) -> str | None:
+    models, _ = get_models()
+    model = models.get(active_key, {})
+    label = model.get("label", active_key)
+    throughput = build_throughput_status(active_key, containers)
+    live = build_live_throughput_status(active_key, containers)
+    gpu_stats = get_gpu_stats()
+
+    parts = []
+    if live.get("tokens_per_second") not in (None, 0.0):
+        parts.append(f"Gen: {live['tokens_per_second']:.1f} T/S")
+    elif throughput.get("tokens_per_second") is not None:
+        parts.append(f"Last Gen: {throughput['tokens_per_second']:.1f} T/S")
+
+    ctx_n = live.get("n_ctx")
+    decoded = live.get("decoded_tokens") or 0
+    with CONTEXT_STATE_LOCK:
+        base = CONTEXT_STATE.get("task_n_tokens") or CONTEXT_STATE.get("n_prompt_tokens") or CONTEXT_STATE.get("n_tokens")
+    if ctx_n is not None and base is not None and base > 10:
+        n_past = base + decoded
+        parts.append(f"Ctx: {n_past}/{ctx_n}")
+
+    if gpu_stats:
+        g0 = gpu_stats[0]
+        parts.append(f"GPU: {g0['util']:.0f}%  VRAM: {g0['mem_used']:.0f}/{g0['mem_total']:.0f}MB  {g0['temp']:.0f}°C")
+
+    if not parts:
+        return f"Heartbeat | {label} | idle"
+    return f"Heartbeat | {label} | " + "  ".join(parts)
+
+
 def _process_log_line(raw_line: str, active_key: str | None = None) -> None:
     match = _LOG_TS_RE.search(raw_line)
     clean = _LOG_TS_RE.sub("", raw_line.strip(), count=1)
@@ -447,6 +499,8 @@ def _run_log_watcher() -> None:
     """Daemon: streams docker logs and emits events into LOG_STATE."""
     proc = None
     current_container: str | None = None
+    _last_heartbeat_ts = 0.0
+    _was_unhealthy = False
     while True:
         try:
             containers = list_llama_compose_containers()
@@ -458,6 +512,7 @@ def _run_log_watcher() -> None:
                     except Exception:
                         pass
                     proc = None
+                    _append_log_event("info", "watcher", f"Detached from container {current_container} (model went away)")
                     current_container = None
                 time.sleep(LOG_WATCHER_INTERVAL_SEC)
                 continue
@@ -469,13 +524,18 @@ def _run_log_watcher() -> None:
 
             _check_restart_count(target)
 
+            currently_unhealthy = False
             for c in containers:
                 if c["name"] == target and "(unhealthy)" in c.get("status", ""):
+                    currently_unhealthy = True
                     if not _has_recent_event("health", 30):
                         _append_log_event(
                             "warning", "health",
                             f"Container {target} is unhealthy — health check failing",
                         )
+            if _was_unhealthy and not currently_unhealthy:
+                _append_log_event("info", "health", f"Container {target} health restored")
+            _was_unhealthy = currently_unhealthy
 
             if target != current_container:
                 if proc is not None:
@@ -484,6 +544,8 @@ def _run_log_watcher() -> None:
                     except Exception:
                         pass
                     proc = None
+                    if current_container:
+                        _append_log_event("info", "watcher", f"Detached from container {current_container}")
                 _ingest_log_tail(target, tail=50, active_key=active_key)
                 proc = subprocess.Popen(
                     ["docker", "logs", "--follow", "--tail", "0", "--timestamps", target],
@@ -492,6 +554,7 @@ def _run_log_watcher() -> None:
                     text=True,
                     bufsize=1,
                 )
+                _append_log_event("info", "watcher", f"Attached to container {target} (model: {active_key})")
                 current_container = target
                 with LOG_LOCK:
                     LOG_STATE["last_container"] = current_container
@@ -513,10 +576,18 @@ def _run_log_watcher() -> None:
                     _process_log_line(line, active_key)
                     count += 1
                 if proc.poll() is not None:
+                    _append_log_event("warning", "watcher", f"Container {current_container} log stream ended (container stopped?)")
                     proc = None
                     current_container = None
             else:
                 time.sleep(LOG_WATCHER_INTERVAL_SEC)
+
+            now = time.time()
+            if now - _last_heartbeat_ts >= HEARTBEAT_INTERVAL_SEC and active_key:
+                hb = _build_heartbeat_summary(active_key, containers)
+                if hb:
+                    _append_log_event("info", "heartbeat", hb)
+                    _last_heartbeat_ts = now
 
         except Exception:
             time.sleep(LOG_WATCHER_INTERVAL_SEC)
@@ -1212,6 +1283,7 @@ def start_switch(model_key: str) -> tuple[bool, str]:
         STATE["last_requested_model"] = model_key
         STATE["last_started_at"] = now_iso()
         STATE["last_message"] = f"Switching to {model['label']}..."
+    _append_log_event("info", "switch", f"Switch requested: {model['label']}")
 
     def _worker() -> None:
         compose_path = model["compose"]
@@ -1228,6 +1300,7 @@ def start_switch(model_key: str) -> tuple[bool, str]:
                 STATE["last_exit_code"] = exit_code
                 STATE["last_output"] = output[-4000:]
                 STATE["last_message"] = f"Switch failed for {model['label']}"
+            _append_log_event("error", "switch", f"Switch failed for {model['label']} (exit {exit_code})")
             return
 
         with STATE_LOCK:
@@ -1244,6 +1317,7 @@ def start_switch(model_key: str) -> tuple[bool, str]:
                     STATE["switch_in_progress"] = False
                     STATE["last_completed_at"] = now_iso()
                     STATE["last_message"] = f"Ready: {model['label']}"
+                _append_log_event("info", "switch", f"Switch complete: {model['label']} is ready")
                 return
 
             with LOG_LOCK:
@@ -1270,6 +1344,7 @@ def start_switch(model_key: str) -> tuple[bool, str]:
             STATE["switch_in_progress"] = False
             STATE["last_completed_at"] = now_iso()
             STATE["last_message"] = f"Load timeout for {model['label']}"
+        _append_log_event("error", "switch", f"Switch timeout: {model['label']} did not become healthy within {SWITCH_READY_TIMEOUT_SEC}s")
 
     threading.Thread(target=_worker, daemon=True).start()
     return True, f"Switch request accepted: {model['label']}"
@@ -1423,6 +1498,10 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
                         STATE["last_message"] = (
                             f"Switch state auto-reset after {int(age)}s (target not healthy yet)"
                         )
+                        _append_log_event(
+                            "warning", "switch",
+                            f"Switch state auto-reset after {int(age)}s for {requested_key}",
+                        )
 
     with STATE_LOCK:
         snapshot = dict(STATE)
@@ -1496,6 +1575,10 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
                     BENCHMARK_STATE["completed_at"] = now_iso()
                     BENCHMARK_STATE["last_error"] = (
                         f"Benchmark marked stale after {int(age)}s and auto-reset"
+                    )
+                    _append_log_event(
+                        "warning", "benchmark",
+                        f"Benchmark auto-reset after {int(age)}s (stale)",
                     )
                     BENCHMARK_STATE["history"].append(
                         {
@@ -2625,6 +2708,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+        self._request_status = status
 
     def _send_html(self, html: str, status: int = 200) -> None:
         payload = html.encode("utf-8")
@@ -2633,53 +2717,83 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+        self._request_status = status
+
+    def _caller_ip(self) -> str:
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        return self.client_address[0]
+
+    def _caller_ua(self) -> str:
+        return self.headers.get("User-Agent", "")
+
+    def _begin_request(self) -> None:
+        self._request_start = time.time()
+        self._request_status = 0
+        self._request_body: dict | None = None
+
+    def _finish_request(self, method: str, path: str) -> None:
+        elapsed_ms = (time.time() - self._request_start) * 1000
+        caller = self._caller_ip()
+        ua = self._caller_ua()
+        status = getattr(self, "_request_status", 0) or 200
+        action = _human_readable_path(path, getattr(self, "_request_body", None))
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        ua_suffix = f'  UA: "{ua}"' if ua else ""
+        print(f"[{ts}] {caller}  {method} {path} → {status}  [{action}]  {elapsed_ms:.1f}ms{ua_suffix}")
+        if path in ("/api/switch", "/api/stop", "/api/restart", "/api/benchmark"):
+            sev = "error" if status >= 400 else "info"
+            _append_log_event(
+                sev,
+                "request",
+                f"[{caller}] {action}" + (f"  [{ua[:80]}]" if ua else ""),
+            )
 
     def do_GET(self) -> None:
+        self._begin_request()
         if self.path in ("/", "/index.html"):
             self._send_html(INDEX_HTML)
-            return
-
-        if self.path == "/api/status":
+        elif self.path == "/api/status":
             status = build_status(self)
             self._send_json(status)
-            return
-
-        self._send_json({"error": "Not found"}, 404)
+        else:
+            self._send_json({"error": "Not found"}, 404)
+        self._finish_request("GET", self.path)
 
     def do_POST(self) -> None:
-        if self.path == "/api/switch":
-            try:
-                content_length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
-                body = json.loads(raw.decode("utf-8"))
-            except Exception:
-                self._send_json({"error": "Invalid JSON body"}, 400)
-                return
+        self._begin_request()
 
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            body = json.loads(raw.decode("utf-8"))
+            self._request_body = body
+        except Exception:
+            self._send_json({"error": "Invalid JSON body"}, 400)
+            self._finish_request("POST", self.path)
+            return
+
+        if self.path == "/api/switch":
             model_key = body.get("model", "")
             accepted, msg = start_switch(model_key)
             if not accepted:
                 self._send_json({"error": msg}, 409)
-                return
-            self._send_json({"message": msg, "status": build_status(self)})
+            else:
+                self._send_json({"message": msg, "status": build_status(self)})
+            self._finish_request("POST", self.path)
             return
 
         if self.path == "/api/benchmark":
-            profile = "balanced"
-            try:
-                content_length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
-                body = json.loads(raw.decode("utf-8"))
-                if isinstance(body, dict):
-                    requested = body.get("profile")
-                    if isinstance(requested, str) and requested.strip():
-                        profile = requested.strip().lower()
-            except Exception:
-                self._send_json({"error": "Invalid JSON body"}, 400)
-                return
+            profile = body.get("profile", "balanced")
+            if isinstance(profile, str) and profile.strip():
+                profile = profile.strip().lower()
+            else:
+                profile = "balanced"
 
             if profile not in {"balanced", "full"}:
                 self._send_json({"error": "Unsupported benchmark profile"}, 400)
+                self._finish_request("POST", self.path)
                 return
 
             models, _ = get_models()
@@ -2687,19 +2801,23 @@ class Handler(BaseHTTPRequestHandler):
             active_key = detect_active_model_key(containers)
             if not active_key or active_key not in models:
                 self._send_json({"error": "No active model detected"}, 409)
+                self._finish_request("POST", self.path)
                 return
             if not is_model_server_healthy(active_key, containers):
                 self._send_json({"error": "Active model is not healthy yet"}, 409)
+                self._finish_request("POST", self.path)
                 return
 
             with STATE_LOCK:
                 if STATE["switch_in_progress"]:
                     self._send_json({"error": "Cannot benchmark while switch is in progress"}, 409)
+                    self._finish_request("POST", self.path)
                     return
 
             with BENCHMARK_LOCK:
                 if BENCHMARK_STATE["in_progress"]:
                     self._send_json({"error": "A benchmark is already in progress"}, 409)
+                    self._finish_request("POST", self.path)
                     return
                 BENCHMARK_STATE["in_progress"] = True
                 BENCHMARK_STATE["profile"] = profile
@@ -2717,6 +2835,8 @@ class Handler(BaseHTTPRequestHandler):
                 started_iso = now_iso()
                 result = None
                 error = None
+                model_label = models[model_key]["label"]
+                _append_log_event("info", "benchmark", f"Benchmark ({benchmark_profile}) started for {model_label}")
                 try:
                     local_containers = list_llama_compose_containers()
                     result, error = run_benchmark_profile(
@@ -2736,35 +2856,33 @@ class Handler(BaseHTTPRequestHandler):
                     BENCHMARK_STATE["completed_at"] = completed_iso
                     if error:
                         BENCHMARK_STATE["last_error"] = error
-                        BENCHMARK_STATE["history"].append(
-                            {
-                                "profile": benchmark_profile,
-                                "model_key": model_key,
-                                "started_at": started_iso,
-                                "completed_at": completed_iso,
-                                "duration_sec": elapsed,
-                                "success": False,
-                                "error": error,
-                            }
-                        )
+                        _append_log_event("error", "benchmark", f"Benchmark failed for {model_label}: {error}")
+                        BENCHMARK_STATE["history"].append({
+                            "profile": benchmark_profile,
+                            "model_key": model_key,
+                            "started_at": started_iso,
+                            "completed_at": completed_iso,
+                            "duration_sec": elapsed,
+                            "success": False,
+                            "error": error,
+                        })
                     elif result is not None:
                         result["started_at"] = started_iso
                         result["completed_at"] = completed_iso
                         result["duration_sec"] = elapsed
                         BENCHMARK_STATE["last_result"] = result
                         BENCHMARK_STATE["last_error"] = None
-                        BENCHMARK_STATE["history"].append(
-                            {
-                                "profile": benchmark_profile,
-                                "model_key": model_key,
-                                "started_at": started_iso,
-                                "completed_at": completed_iso,
-                                "duration_sec": elapsed,
-                                "success": True,
-                                "prefill_tps": result["prefill_tps"],
-                                "gen_tps": result["gen_tps"],
-                            }
-                        )
+                        _append_log_event("info", "benchmark", f"Benchmark ({benchmark_profile}) for {model_label}: prefill {result['prefill_tps']:.1f} T/S, gen {result['gen_tps']:.1f} T/S")
+                        BENCHMARK_STATE["history"].append({
+                            "profile": benchmark_profile,
+                            "model_key": model_key,
+                            "started_at": started_iso,
+                            "completed_at": completed_iso,
+                            "duration_sec": elapsed,
+                            "success": True,
+                            "prefill_tps": result["prefill_tps"],
+                            "gen_tps": result["gen_tps"],
+                        })
                     else:
                         BENCHMARK_STATE["last_error"] = "Benchmark failed without result"
                     BENCHMARK_STATE["history"] = BENCHMARK_STATE["history"][-FULL_BENCHMARK_MAX_HISTORY:]
@@ -2788,15 +2906,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(
                 {"message": f"{profile.capitalize()} benchmark started", "status": build_status(self)}
             )
+            self._finish_request("POST", self.path)
             return
 
         if self.path == "/api/stop":
             with STATE_LOCK:
                 if STATE["switch_in_progress"]:
                     self._send_json({"error": "A switch is already in progress"}, 409)
+                    self._finish_request("POST", self.path)
                     return
                 STATE["switch_in_progress"] = True
                 STATE["last_message"] = "Stopping all models..."
+            _append_log_event("info", "stop", "Stop-all initiated")
 
             def _stop_worker() -> None:
                 cmd = [
@@ -2809,9 +2930,13 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["last_exit_code"] = exit_code
                     STATE["last_output"] = output[-2000:]
                     STATE["last_message"] = "All models stopped." if exit_code == 0 else "Stop-all failed."
+                sev = "info" if exit_code == 0 else "error"
+                msg = "All models stopped" if exit_code == 0 else f"Stop-all failed (exit {exit_code})"
+                _append_log_event(sev, "stop", msg)
 
             threading.Thread(target=_stop_worker, daemon=True).start()
             self._send_json({"message": "Stop-all initiated"})
+            self._finish_request("POST", self.path)
             return
 
         if self.path == "/api/restart":
@@ -2820,27 +2945,30 @@ class Handler(BaseHTTPRequestHandler):
             active_key = detect_active_model_key(containers)
             if not active_key:
                 self._send_json({"error": "No active model to restart"}, 409)
+                self._finish_request("POST", self.path)
                 return
             accepted, msg = start_switch(active_key)
             if not accepted:
                 self._send_json({"error": msg}, 409)
-                return
-            self._send_json({"message": msg, "status": build_status(self)})
+            else:
+                self._send_json({"message": msg, "status": build_status(self)})
+            self._finish_request("POST", self.path)
             return
 
-        # Emergency reset — clears stuck switch_in_progress without touching containers
         if self.path == "/api/reset":
             with STATE_LOCK:
                 STATE["switch_in_progress"] = False
                 STATE["last_message"] = "State reset by user."
+            _append_log_event("info", "reset", "State reset by user")
             self._send_json({"message": "State reset"})
+            self._finish_request("POST", self.path)
             return
 
         self._send_json({"error": "Not found"}, 404)
+        self._finish_request("POST", self.path)
 
     def log_message(self, fmt: str, *args) -> None:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{ts}] {self.address_string()} {fmt % args}")
+        pass
 
 
 def main() -> None:

@@ -694,16 +694,16 @@ def find_model_server_container_name(model_key: str, containers: list[dict]) -> 
     return None
 
 
-def parse_latest_completion(log_text: str) -> tuple[float | None, float | None, int | None, str | None, str | None, float | None]:
+def parse_latest_completion(log_text: str) -> tuple[float | None, float | None, int | None, str | None, str | None, float | None, int | None]:
     latest_gen_tps = None
     latest_ingest_tps = None
+    latest_prompt_tokens = None
     latest_task_id = None
     latest_eval_line = None
     latest_ingest_line = None
     latest_ts_f = None
     current_task_id = None
     for line in log_text.splitlines():
-        # Handle timestamp prefix
         ts_match = _LOG_TS_RE.search(line)
         line_ts_f = None
         if ts_match:
@@ -723,19 +723,20 @@ def parse_latest_completion(log_text: str) -> tuple[float | None, float | None, 
             val = float(ingest_match.group(2))
             if n_tok > 10 and val < 20000:
                 latest_ingest_tps = val
+                latest_prompt_tokens = n_tok
                 latest_ingest_line = line.strip()
                 if line_ts_f: latest_ts_f = line_ts_f
 
         match = EVAL_TPS_PATTERN.search(line)
         if match:
             val = float(match.group(1))
-            if val < 20000: # Sanity check
+            if val < 20000:
                 latest_gen_tps = val
                 latest_task_id = current_task_id
                 latest_eval_line = line.strip()
                 if line_ts_f: latest_ts_f = line_ts_f
 
-    return latest_gen_tps, latest_ingest_tps, latest_task_id, latest_eval_line, latest_ingest_line, latest_ts_f
+    return latest_gen_tps, latest_ingest_tps, latest_task_id, latest_eval_line, latest_ingest_line, latest_ts_f, latest_prompt_tokens
 
 
 def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) -> dict:
@@ -965,7 +966,7 @@ def build_throughput_status(active_key: str | None, containers: list[dict]) -> d
             "detail": "Failed to read llama.cpp logs",
         }
     else:
-        gen_tps, ingest_tps, completion_id, completion_line, ingest_line, ts_f = parse_latest_completion(output)
+        gen_tps, ingest_tps, completion_id, completion_line, ingest_line, ts_f, prompt_tokens = parse_latest_completion(output)
         completion_key = (
             f"task:{completion_id}" if completion_id is not None else f"line:{completion_line}"
         )
@@ -975,6 +976,7 @@ def build_throughput_status(active_key: str | None, containers: list[dict]) -> d
                 "ingest_tps": None,
                 "completion_id": None,
                 "completion_key": None,
+                "prompt_tokens": None,
                 "ts_f": ts_f,
                 "source": "logs",
                 "updated_at": now_iso(),
@@ -988,6 +990,7 @@ def build_throughput_status(active_key: str | None, containers: list[dict]) -> d
                 "ingest_tps": ingest_tps,
                 "completion_id": completion_id,
                 "completion_key": completion_key,
+                "prompt_tokens": prompt_tokens,
                 "ts_f": ts_f,
                 "source": "logs",
                 "updated_at": now_iso(),
@@ -1090,6 +1093,38 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
             stats["completed_count"] += 1
             stats["completed_sum_tps"] += float(completion_tps)
             stats["average_rate_tps"] = stats["completed_sum_tps"] / stats["completed_count"]
+
+            models, _ = get_models()
+            model = models.get(active_key, {})
+            label = model.get("label", active_key)
+            quant = model.get("quant", "")
+
+            n_prompt = completed.get("prompt_tokens")
+            n_gen = completed.get("tokens_per_second")
+            n_ingest = completed.get("ingest_tps")
+            task_id = completed.get("completion_id")
+
+            with CONTEXT_STATE_LOCK:
+                n_ctx = CONTEXT_STATE.get("n_ctx_slot")
+                n_past_from_log = CONTEXT_STATE.get("task_n_tokens") or CONTEXT_STATE.get("n_prompt_tokens") or CONTEXT_STATE.get("n_tokens")
+            if n_ctx is None and isinstance(n_past_from_log, int) and n_past_from_log > 10:
+                n_ctx = n_past_from_log
+
+            parts = [label]
+            if quant:
+                parts.append(f"({quant})")
+            parts.append(f"task:{task_id}" if task_id is not None else f"key:{completion_key}")
+            if isinstance(n_prompt, int) and n_prompt > 0:
+                parts.append(f"{n_prompt} prompt tok")
+            if isinstance(n_gen, (int, float)):
+                parts.append(f"{n_gen:.1f} gen T/S")
+            if isinstance(n_ingest, (int, float)):
+                parts.append(f"{n_ingest:.1f} ing T/S")
+            if n_ctx is not None and n_past_from_log is not None and n_past_from_log > 0:
+                parts.append(f"ctx {n_past_from_log}/{n_ctx}")
+            parts.append(f"run #{stats['completed_count']}")
+
+            _append_log_event("info", "completion", "Completed Run | " + "  ".join(parts))
         # Always update ingest from completions, even for dup keys
         if isinstance(completion_ingest, (int, float)) and completion_ingest > 0:
             stats["last_ingest_tps"] = float(completion_ingest)

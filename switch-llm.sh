@@ -45,6 +45,20 @@ discover_stacks() {
 # Stop all discovered stacks
 # ---------------------------------------------------------------------------
 stop_all() {
+    if [ -n "$VLLM_DIR" ] && [ -d "$VLLM_DIR" ]; then
+        echo "Stopping any running vLLM stacks..."
+        # Try compose down first (works when Docker Compose v2 tracks project state)
+        cd "$VLLM_DIR" && docker compose -p vllm down --remove-orphans 2>/dev/null
+        cd - >/dev/null
+        # Belt-and-suspenders: stop any remaining containers with the vllm project label
+        local vllm_running
+        vllm_running=$(docker ps -q --filter "label=com.docker.compose.project=vllm" 2>/dev/null)
+        if [ -n "$vllm_running" ]; then
+            echo "Force-stopping lingering vLLM containers..."
+            echo "$vllm_running" | xargs docker stop 2>/dev/null || true
+            docker ps -aq --filter "label=com.docker.compose.project=vllm" | xargs docker rm -f 2>/dev/null || true
+        fi
+    fi
     echo "Stopping any running containers from all stacks..."
     cd "$LLAMA_DIR" || exit 1
     while IFS= read -r f; do

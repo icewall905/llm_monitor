@@ -12,7 +12,7 @@ trap cleanup INT TERM EXIT
 /usr/local/bin/ttyd -p "${TTYD_INTERNAL_PORT}" -W /usr/local/bin/launch-monitor.sh &
 TTYD_PID=$!
 
-python3 /usr/local/bin/dashboard-server.py &
+python3 -u /usr/local/bin/dashboard-server.py &
 DASH_PID=$!
 
 nginx -g 'daemon off;' &

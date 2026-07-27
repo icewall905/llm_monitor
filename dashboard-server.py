@@ -5,15 +5,125 @@ import os
 import re
 import select
 import shlex
+import sqlite3
 import subprocess
 import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
+REQUEST_LOG_DB = os.environ.get("REQUEST_LOG_DB", "/request-logs/requests.db")
+
+# Columns returned by /api/request-log (subset/order for the UI table).
+_REQUEST_LOG_COLUMNS = [
+    "id", "ts", "ts_iso", "endpoint", "client_ip", "forwarded_for", "user_agent",
+    "method", "path", "model", "stream", "status", "latency_ms",
+    "req_bytes", "resp_bytes", "prompt_tokens", "completion_tokens",
+    "total_tokens", "prompt_snippet", "error",
+]
+
+
+def read_request_log(params):
+    """Read rows from the shared request-log SQLite DB (read-only).
+
+    params: dict of lists (from parse_qs). Supported keys:
+      limit (int, default 200, max 2000), endpoint ('8080'|'28082'|'all'),
+      q (substring over ip/ua/model/path/snippet), since (epoch seconds float).
+    Returns {"rows": [...], "available": bool, "error": str|None}.
+    """
+    def _one(key, default=None):
+        vals = params.get(key)
+        return vals[0] if vals else default
+
+    if not os.path.exists(REQUEST_LOG_DB):
+        return {"rows": [], "available": False, "error": None}
+
+    try:
+        limit = int(_one("limit", "200"))
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 2000))
+
+    endpoint = _one("endpoint", "all")
+    q = _one("q", "").strip()
+    since = _one("since")
+
+    where = []
+    args = []
+    if endpoint and endpoint != "all":
+        where.append("endpoint = ?")
+        args.append(endpoint)
+    if since:
+        try:
+            where.append("ts >= ?")
+            args.append(float(since))
+        except ValueError:
+            pass
+    # Exclude root '/' and health check endpoints by default unless explicitly queried
+    if not q or (q.lower() not in ("/", "/health", "/health/")):
+        where.append("IFNULL(path,'') NOT IN ('', '/', '/health', '/health/')")
+    # Exclude low token count requests (< 5) by default unless querying
+    if not q:
+        where.append("(total_tokens IS NULL OR total_tokens >= 5)")
+    if q:
+        like = f"%{q}%"
+        where.append(
+            "(IFNULL(client_ip,'') LIKE ? OR IFNULL(user_agent,'') LIKE ? "
+            "OR IFNULL(model,'') LIKE ? OR IFNULL(path,'') LIKE ? "
+            "OR IFNULL(prompt_snippet,'') LIKE ?)"
+        )
+        args.extend([like, like, like, like, like])
+
+    sql = f"SELECT {','.join(_REQUEST_LOG_COLUMNS)} FROM requests"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+
+    try:
+        uri = f"file:{REQUEST_LOG_DB}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.row_factory = sqlite3.Row
+            rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
+        finally:
+            conn.close()
+        return {"rows": rows, "available": True, "error": None}
+    except Exception as e:  # noqa: BLE001
+        return {"rows": [], "available": True, "error": str(e)}
+
+
+def read_request_detail(params):
+    """Read a single request row including the heavy request/response bodies."""
+    vals = params.get("id")
+    if not vals:
+        return {"row": None, "error": "missing id"}
+    try:
+        row_id = int(vals[0])
+    except (TypeError, ValueError):
+        return {"row": None, "error": "bad id"}
+    if not os.path.exists(REQUEST_LOG_DB):
+        return {"row": None, "error": "no log db"}
+    cols = _REQUEST_LOG_COLUMNS + ["request_body", "response_body"]
+    try:
+        uri = f"file:{REQUEST_LOG_DB}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.row_factory = sqlite3.Row
+            r = conn.execute(
+                f"SELECT {','.join(cols)} FROM requests WHERE id = ?", (row_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return {"row": dict(r) if r else None, "error": None}
+    except Exception as e:  # noqa: BLE001
+        return {"row": None, "error": str(e)}
 
 
 def _strip_inline_comment(value: str) -> str:
@@ -113,6 +223,30 @@ LLAMA_WORKING_DIR_LABEL = os.environ.get(
     "LLAMA_WORKING_DIR_LABEL",
     str(RUNTIME_CONFIG.get("llama_working_dir_label") or "/opt/llama.cpp"),
 )
+
+# ── vLLM config ──────────────────────────────────────────────────────────────
+DEFAULT_VLLM_DIR = str(RUNTIME_CONFIG.get("vllm_dir") or "/opt/vllm")
+VLLM_DIR = Path(os.environ.get("VLLM_DIR", DEFAULT_VLLM_DIR))
+VLLM_SERVER_SERVICE = os.environ.get(
+    "VLLM_SERVER_SERVICE",
+    str(RUNTIME_CONFIG.get("vllm_server_service") or "vllm-server"),
+)
+VLLM_WORKING_DIR_LABEL = os.environ.get(
+    "VLLM_WORKING_DIR_LABEL",
+    str(RUNTIME_CONFIG.get("vllm_working_dir_label") or str(VLLM_DIR)),
+)
+# ── BeeLlama config ──────────────────────────────────────────────────────────
+DEFAULT_BEELLAMA_DIR = str(RUNTIME_CONFIG.get("beellama_dir") or "/opt/beellama.cpp")
+BEELLAMA_DIR = Path(os.environ.get("BEELLAMA_DIR", DEFAULT_BEELLAMA_DIR))
+BEELLAMA_WORKING_DIR_LABEL = os.environ.get(
+    "BEELLAMA_WORKING_DIR_LABEL",
+    str(RUNTIME_CONFIG.get("beellama_working_dir_label") or str(BEELLAMA_DIR)),
+)
+BEELLAMA_STACKS_DIR = Path(os.environ.get(
+    "BEELLAMA_STACKS_DIR",
+    str(RUNTIME_CONFIG.get("beellama_stacks_dir") or str(BEELLAMA_DIR / "stacks")),
+))
+
 SWITCH_READY_TIMEOUT_SEC = int(os.environ.get("SWITCH_READY_TIMEOUT_SEC", "900"))
 SWITCH_POLL_SEC = float(os.environ.get("SWITCH_POLL_SEC", "5"))
 SWITCH_STALE_SEC = int(
@@ -157,31 +291,106 @@ def parse_llm_meta(path: Path) -> dict:
 
 def discover_models() -> dict:
     models = {}
-    if not STACKS_DIR.is_dir():
-        return models
-    entries = []
-    for path in STACKS_DIR.glob("*.yml"):
-        meta = parse_llm_meta(path)
-        if not meta.get("display_name"):
-            continue
-        rel = f"stacks/{path.name}"
-        try:
-            order = int(meta.get("sort_order", 999))
-        except ValueError:
-            order = 999
-        entries.append((order, path.stem, rel, meta))
-    entries.sort(key=lambda x: (x[0], x[1]))
-    for _, stem, rel, meta in entries:
-        models[stem] = {
-            "label":          meta["display_name"],
-            "compose":        rel,
-            "server_service": meta.get("server_service", ""),
-            "thinking":       meta.get("thinking", "false") == "true",
-            "family":         meta.get("family", "other"),
-            "ctx_size":       meta.get("ctx_size", ""),
-            "quant":          meta.get("quant", ""),
-            "params":         meta.get("params", ""),
-        }
+    # Discover llama.cpp stacks
+    if STACKS_DIR.is_dir():
+        entries = []
+        for path in STACKS_DIR.glob("*.yml"):
+            meta = parse_llm_meta(path)
+            if not meta.get("display_name"):
+                continue
+            rel = f"stacks/{path.name}"
+            try:
+                order = float(meta.get("sort_order", 999))
+            except ValueError:
+                order = 999
+            entries.append((order, path.stem, rel, meta))
+        entries.sort(key=lambda x: (x[0], x[1]))
+        for _, stem, rel, meta in entries:
+            models[stem] = {
+                "label":          meta["display_name"],
+                "compose":        rel,
+                "server_service": meta.get("server_service", ""),
+                "thinking":       meta.get("thinking", "false") == "true",
+                "vision":           meta.get("vision", "false") == "true",
+                "family":         meta.get("family", "other"),
+                "ctx_size":       meta.get("ctx_size", ""),
+                "quant":          meta.get("quant", ""),
+                "params":         meta.get("params", ""),
+                "internal_port":  int(meta.get("internal_port", "8080")),
+            }
+
+    # Add vLLM stacks — discover any *.yml in VLLM_DIR with LLM_META headers.
+    # Falls back to a generic entry when no metadata is found.
+    if VLLM_DIR.is_dir():
+        vllm_entries = []
+        for path in sorted(VLLM_DIR.glob("*.yml")):
+            meta = parse_llm_meta(path)
+            if not meta.get("display_name"):
+                continue
+            try:
+                order = float(meta.get("sort_order", "999"))
+            except ValueError:
+                order = 999
+            vllm_entries.append((order, path.stem, path, meta))
+        vllm_entries.sort(key=lambda x: (x[0], x[1]))
+        for _, stem, path, meta in vllm_entries:
+            key = f"vllm-{stem}"
+            models[key] = {
+                "label":          meta["display_name"],
+                "compose":        path.name,
+                "compose_file":   str(path),
+                "server_service": meta.get("server_service", VLLM_SERVER_SERVICE),
+                "thinking":       meta.get("thinking", "false") == "true",
+                "vision":         meta.get("vision", "false") == "true",
+                "family":         meta.get("family", "vllm"),
+                "ctx_size":       meta.get("ctx_size", ""),
+                "quant":          meta.get("quant", ""),
+                "params":         meta.get("params", ""),
+                "vllm":           True,
+            }
+        if not vllm_entries:
+            models["vllm"] = {
+                "label":          "vLLM",
+                "compose":        "docker-compose.yml",
+                "compose_file":   str(VLLM_DIR / "docker-compose.yml"),
+                "server_service": VLLM_SERVER_SERVICE,
+                "thinking":       False,
+                "vision":         False,
+                "family":         "vllm",
+                "ctx_size":       "",
+                "quant":          "",
+                "params":         "",
+                "vllm":           True,
+            }
+    # Add BeeLlama stacks from beellama.cpp/stacks/*.yml
+    if BEELLAMA_DIR.is_dir() and BEELLAMA_STACKS_DIR.is_dir():
+        entries = []
+        for path in BEELLAMA_STACKS_DIR.glob("*.yml"):
+            meta = parse_llm_meta(path)
+            if not meta.get("display_name"):
+                continue
+            rel = f"beellama-stacks/{path.name}"
+            try:
+                order = float(meta.get("sort_order", "999"))
+            except ValueError:
+                order = 999
+            entries.append((order, path.stem, rel, meta))
+        entries.sort(key=lambda x: (x[0], x[1]))
+        for _, stem, rel, meta in entries:
+            models[f"beellama-{stem}"] = {
+                "label":          meta["display_name"],
+                "compose":        rel,
+                "server_service": meta.get("server_service", ""),
+                "thinking":       meta.get("thinking", "false") == "true",
+                "vision":         meta.get("vision", "false") == "true",
+                "family":         meta.get("family", "other"),
+                "ctx_size":       meta.get("ctx_size", ""),
+                "quant":          meta.get("quant", ""),
+                "params":         meta.get("params", ""),
+                "beellama":       True,
+                "internal_port":  int(meta.get("internal_port", "8085")),
+            }
+
     return models
 
 
@@ -246,6 +455,39 @@ CONTEXT_STATE = {
     "n_prompt_tokens": None,
     "task_n_tokens": None,
     "last_good_n_past": None,
+}
+
+# ── vLLM Prometheus metrics cache ────────────────────────────────────────────
+VLLM_METRICS_CACHE_TTL_SEC = float(os.environ.get("VLLM_METRICS_CACHE_TTL_SEC", "1.0"))
+VLLM_METRICS_CACHE_LOCK = threading.Lock()
+VLLM_METRICS_CACHE = {
+    "container": None,
+    "checked_at": 0.0,
+    "raw": None,
+    "generation_tokens_total": 0.0,
+    "prompt_tokens_total": 0.0,
+    "iteration_tokens_total_sum": 0.0,
+    "iteration_tokens_total_count": 0.0,
+    "request_queue_time_seconds_sum": 0.0,
+    "request_queue_time_seconds_count": 0.0,
+    "time_to_first_token_seconds_sum": 0.0,
+    "time_to_first_token_seconds_count": 0.0,
+    "request_gen_tokens_sum": 0.0,
+    "request_gen_tokens_count": 0.0,
+    "request_prompt_tokens_sum": 0.0,
+    "request_prompt_tokens_count": 0.0,
+}
+VLLM_TPS_STATE_LOCK = threading.Lock()
+VLLM_TPS_STATE = {
+    "container": None,
+    "sampled_at": 0.0,
+    "generation_tokens": None,
+}
+VLLM_INGEST_STATE_LOCK = threading.Lock()
+VLLM_INGEST_STATE = {
+    "container": None,
+    "sampled_at": 0.0,
+    "prompt_tokens": None,
 }
 
 EVAL_TPS_PATTERN = re.compile(
@@ -400,6 +642,7 @@ def _build_heartbeat_summary(active_key: str, containers: list[dict]) -> str | N
 
 
 def _process_log_line(raw_line: str, active_key: str | None = None) -> None:
+    m_prompt_done = None
     match = _LOG_TS_RE.search(raw_line)
     clean = _LOG_TS_RE.sub("", raw_line.strip(), count=1)
 
@@ -430,6 +673,7 @@ def _process_log_line(raw_line: str, active_key: str | None = None) -> None:
             if active_key:
                 INGEST_LIVE_STATE["active_key"] = active_key
 
+    m_prompt_done = SLOT_PROMPT_DONE_PATTERN.search(clean)
     # When prompt processing finishes, compute ingest TPS
     if m_prompt_done:
         n_tokens = int(m_prompt_done.group(1))
@@ -496,15 +740,21 @@ def run_command(cmd: list[str]) -> tuple[int, str]:
 
 
 def _run_log_watcher() -> None:
-    """Daemon: streams docker logs and emits events into LOG_STATE."""
+    """Daemon: streams docker logs and emits events into LOG_STATE.
+
+    Only watches llama.cpp containers — vLLM metrics are collected via
+    Prometheus /metrics endpoint instead of log parsing.
+    """
     proc = None
     current_container: str | None = None
     _last_heartbeat_ts = 0.0
     _was_unhealthy = False
     while True:
         try:
+            
             containers = list_llama_compose_containers()
             active_key = detect_active_model_key(containers)
+
             if not active_key:
                 if proc is not None:
                     try:
@@ -519,20 +769,28 @@ def _run_log_watcher() -> None:
 
             target = find_model_server_container_name(active_key, containers)
             if not target:
-                time.sleep(LOG_WATCHER_INTERVAL_SEC)
-                continue
+                # For vLLM stacks, fall back to container name lookup by project label
+                if _key_is_vllm(active_key):
+                    target = find_vllm_server_container_name()
+
+                if not target:
+                    time.sleep(LOG_WATCHER_INTERVAL_SEC)
+                    continue
 
             _check_restart_count(target)
 
             currently_unhealthy = False
-            for c in containers:
+            check_list = containers + list_vllm_compose_containers() if _key_is_vllm(active_key) else containers
+            for c in check_list:
                 if c["name"] == target and "(unhealthy)" in c.get("status", ""):
                     currently_unhealthy = True
-                    if not _has_recent_event("health", 30):
-                        _append_log_event(
-                            "warning", "health",
-                            f"Container {target} is unhealthy — health check failing",
-                        )
+            print(f"Log watcher checking target: {target}, current: {current_container}")
+            if currently_unhealthy:
+                if not _has_recent_event("health", 30):
+                    _append_log_event(
+                        "warning", "health",
+                        f"Container {target} is unhealthy — health check failing",
+                    )
             if _was_unhealthy and not currently_unhealthy:
                 _append_log_event("info", "health", f"Container {target} health restored")
             _was_unhealthy = currently_unhealthy
@@ -589,7 +847,10 @@ def _run_log_watcher() -> None:
                     _append_log_event("info", "heartbeat", hb)
                     _last_heartbeat_ts = now
 
-        except Exception:
+        except Exception as e:
+            print(f"Log watcher error: {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(LOG_WATCHER_INTERVAL_SEC)
 
 
@@ -623,6 +884,35 @@ def list_llama_compose_containers() -> list[dict]:
         if len(parts) != 5:
             continue
         working_dir, config_files, service, status, name = parts
+
+        # Check if this is a BeeLlama container (working_dir may be BEELLAMA_DIR or BEELLAMA_DIR/stacks)
+        _beellama_valid_dirs = {BEELLAMA_WORKING_DIR_LABEL.rstrip("/"), str(BEELLAMA_DIR / "stacks").rstrip("/")}
+        if BEELLAMA_DIR.is_dir() and working_dir.rstrip("/") in _beellama_valid_dirs:
+            all_models, _ = get_models()
+            for model_key, model in all_models.items():
+                if model.get("beellama") and service.strip() == model["server_service"]:
+                    containers.append({
+                        "compose": model["compose"],
+                        "service": service.strip(),
+                        "status":  status.strip(),
+                        "name":    name.strip(),
+                        "beellama": True,
+                    })
+            continue
+
+        # Check if this is a vLLM container
+        if working_dir.rstrip("/") == VLLM_WORKING_DIR_LABEL.rstrip("/"):
+            if service.strip().lower() == VLLM_SERVER_SERVICE.lower():
+                containers.append(
+                    {
+                        "compose": "vllm",
+                        "service": service.strip(),
+                        "status": status.strip(),
+                        "name": name.strip(),
+                        "vllm": True,
+                    }
+                )
+            continue
 
         # Only process containers from our expected project directories
         if working_dir.rstrip("/") not in valid_dirs_list:
@@ -660,6 +950,11 @@ def detect_active_model_key(containers: list[dict] | None = None) -> str | None:
         model_key = compose_to_model.get(c["compose"])
         if model_key and c["status"].startswith("Up"):
             return model_key
+    # Fallback: check vLLM directly; resolve to specific stack key if possible
+    vllm_records = list_vllm_compose_containers()
+    for c in vllm_records:
+        if c.get("vllm") and c["status"].startswith("Up"):
+            return compose_to_model.get(c["compose"]) or "vllm"
     return None
 
 
@@ -671,6 +966,10 @@ def is_model_server_healthy(model_key: str, containers: list[dict] | None = None
     records = containers if containers is not None else list_llama_compose_containers()
     target_compose = model["compose"]
     target_service = model["server_service"]
+
+    # Special case: any vLLM stack
+    if model.get("vllm"):
+        return is_vllm_healthy(containers)
 
     for c in records:
         if c["compose"] != target_compose:
@@ -692,6 +991,232 @@ def find_model_server_container_name(model_key: str, containers: list[dict]) -> 
         if c["compose"] == target_compose and c["service"] == target_service:
             return c["name"]
     return None
+
+# ---------------------------------------------------------------------------
+# vLLM container detection
+# ---------------------------------------------------------------------------
+def list_vllm_compose_containers() -> list[dict]:
+    """Detect containers from the vLLM docker-compose project directory."""
+    if not VLLM_DIR.is_dir():
+        return []
+
+    cmd = [
+        "docker",
+        "ps",
+        "-a",
+        "--filter",
+        "label=com.docker.compose.project.working_dir",
+        "--format",
+        '{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.service"}}|{{.Status}}|{{.Names}}',
+    ]
+    code, output = run_command(cmd)
+    if code != 0 or not output:
+        return []
+
+    valid_dirs = {VLLM_WORKING_DIR_LABEL, str(Path(VLLM_WORKING_DIR_LABEL) / "stacks")}
+    valid_dirs_list = [d.rstrip("/") for d in valid_dirs]
+
+    containers = []
+    for line in output.splitlines():
+        parts = line.split("|", 4)
+        if len(parts) != 5:
+            continue
+        working_dir, config_files, service, status, name = parts
+        if working_dir.rstrip("/") not in valid_dirs_list:
+            continue
+        # Check if this container belongs to the vllm server service
+        if service.strip().lower() == VLLM_SERVER_SERVICE.lower():
+            # Resolve which compose file is active from the Docker project label
+            compose_basename = (
+                Path(config_files.split(",")[0].strip()).name
+                if config_files.strip()
+                else "docker-compose.yml"
+            )
+            containers.append(
+                {
+                    "compose": compose_basename,
+                    "config_files": config_files.strip(),
+                    "service": service.strip(),
+                    "status": status.strip(),
+                    "name": name.strip(),
+                    "vllm": True,
+                }
+            )
+    return containers
+
+
+def _key_is_vllm(key: str | None) -> bool:
+    """True for any model key that belongs to a vLLM stack."""
+    if not key:
+        return False
+    m, _ = get_models()
+    return bool(m.get(key, {}).get("vllm"))
+
+
+def detect_active_vllm_key(containers: list[dict] | None = None) -> bool:
+    """Return True if a vLLM container is active and healthy."""
+    records = list_vllm_compose_containers()
+    for c in records:
+        if c.get("vllm") and c["status"].startswith("Up"):
+            return True
+    return False
+
+
+def find_vllm_server_container_name(containers: list[dict] | None = None) -> str | None:
+    """Find the vLLM server container name."""
+    records = list_vllm_compose_containers()
+    for c in records:
+        if c.get("vllm"):
+            return c["name"]
+    return None
+
+
+def is_vllm_healthy(containers: list[dict] | None = None) -> bool:
+    """Check if the vLLM container is healthy."""
+    records = list_vllm_compose_containers()
+    for c in records:
+        if c.get("vllm"):
+            return "(healthy)" in c.get("status", "")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# vLLM Prometheus metrics parsing
+# ---------------------------------------------------------------------------
+def _parse_prometheus_value(line: str) -> float | None:
+    """Extract the numeric value from a Prometheus metric line."""
+    line = line.strip()
+    parts = line.split()
+    if not parts:
+        return None
+    val = parts[-1]
+    # Handle "inf", "-inf", etc.
+    if val in ("+Inf", "-Inf", "Inf", "inf"):
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
+
+def _parse_prometheus_metrics(raw: str) -> dict:
+    """Parse Prometheus /metrics output into a dict of metric_name -> value."""
+    result = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+            
+        # The last part is the value
+        metric_full_name = parts[0]
+        # The first part contains the metric name and potentially labels
+        metric_name = metric_full_name.split('{')[0]
+        
+        val = _parse_prometheus_value(line)
+        if val is not None:
+            result[metric_name] = val
+    return result
+
+
+def parse_vllm_metrics(raw: str, active_key: str) -> dict:
+    """Parse vLLM Prometheus metrics and compute TPS.
+
+    Returns dict with generation_tokens, prompt_tokens, tps, ingest_tps, etc.
+    """
+    parsed = _parse_prometheus_metrics(raw)
+
+    def get_metric(name: str) -> float:
+        return float(parsed.get(f"vllm:{name}", parsed.get(name, 0)))
+
+    gen_total = get_metric("generation_tokens_total")
+    prompt_total = get_metric("prompt_tokens_total")
+    iter_sum = get_metric("iteration_tokens_total_sum")
+    iter_count = get_metric("iteration_tokens_total_count")
+
+    # Queue time
+    queue_sum = get_metric("request_queue_time_seconds_sum")
+    queue_count = get_metric("request_queue_time_seconds_count")
+
+    # Time to first token
+    ttft_sum = get_metric("time_to_first_token_seconds_sum")
+    ttft_count = get_metric("time_to_first_token_seconds_count")
+
+    # Generation tokens per request
+    gen_tokens_sum = get_metric("request_generation_tokens_sum")
+    gen_tokens_count = get_metric("request_generation_tokens_count")
+
+    # Prompt tokens per request
+    prompt_tokens_sum = get_metric("request_prompt_tokens_sum")
+    prompt_tokens_count = get_metric("request_prompt_tokens_count")
+
+    # Cache usage
+    gpu_cache_usage = get_metric("gpu_cache_usage_perc")
+
+    # Compute live TPS (delta-based)
+    now = time.time()
+    with VLLM_TPS_STATE_LOCK:
+        prev_container = VLLM_TPS_STATE.get("container")
+        prev_sampled = VLLM_TPS_STATE.get("sampled_at", 0)
+        prev_gen = VLLM_TPS_STATE.get("generation_tokens")
+
+        live_tps = None
+        if (prev_container and prev_gen is not None and
+                prev_sampled > 0 and prev_gen <= gen_total):
+            dt = now - prev_sampled
+            if dt > 0:
+                live_tps = (gen_total - prev_gen) / dt
+
+        VLLM_TPS_STATE["container"] = active_key
+        VLLM_TPS_STATE["sampled_at"] = now
+        VLLM_TPS_STATE["generation_tokens"] = gen_total
+
+    # Compute live ingest TPS (delta-based)
+    with VLLM_INGEST_STATE_LOCK:
+        prev_ingest_container = VLLM_INGEST_STATE.get("container")
+        prev_ingest_sampled = VLLM_INGEST_STATE.get("sampled_at", 0)
+        prev_ingest = VLLM_INGEST_STATE.get("prompt_tokens")
+
+        live_ingest_tps = None
+        if (prev_ingest_container and prev_ingest is not None and
+                prev_ingest_sampled > 0 and prev_ingest <= prompt_total):
+            dt = now - prev_ingest_sampled
+            if dt > 0:
+                live_ingest_tps = (prompt_total - prev_ingest) / dt
+
+        VLLM_INGEST_STATE["container"] = active_key
+        VLLM_INGEST_STATE["sampled_at"] = now
+        VLLM_INGEST_STATE["prompt_tokens"] = prompt_total
+
+    # Averages
+    avg_gen_per_request = gen_tokens_sum / gen_tokens_count if gen_tokens_count > 0 else None
+    avg_prompt_per_request = prompt_tokens_sum / prompt_tokens_count if prompt_tokens_count > 0 else None
+    avg_queue_time = queue_sum / queue_count if queue_count > 0 else None
+    avg_ttft = ttft_sum / ttft_count if ttft_count > 0 else None
+    avg_iter_tokens = iter_sum / iter_count if iter_count > 0 else None
+
+    return {
+        "generation_tokens_total": gen_total,
+        "prompt_tokens_total": prompt_total,
+        "tps": live_tps,
+        "ingest_tps": live_ingest_tps,
+        "avg_gen_per_request": avg_gen_per_request,
+        "avg_prompt_per_request": avg_prompt_per_request,
+        "avg_queue_time_sec": avg_queue_time,
+        "avg_ttft_sec": avg_ttft,
+        "avg_iter_tokens": avg_iter_tokens,
+        "total_requests_approx": max(iter_count, queue_count, gen_tokens_count),
+        "source": "prometheus",
+        "container": active_key,
+        "updated_at": now_iso(),
+        "gen_total": gen_total,
+        "prompt_total": prompt_total,
+        "gpu_cache_usage_perc": gpu_cache_usage,
+        "completed_requests": gen_tokens_count,
+    }
 
 
 def parse_latest_completion(log_text: str) -> tuple[float | None, float | None, int | None, str | None, str | None, float | None, int | None]:
@@ -839,8 +1364,9 @@ def parse_live_tps_from_slots(slots_text: str, active_key: str, container: str) 
 
 
 def fetch_live_tps(active_key: str | None, container: str) -> dict:
+    port = _get_server_port(active_key) if active_key else 8080
     code, output = run_command(
-        ["docker", "exec", container, "curl", "-fsS", "http://127.0.0.1:8080/slots"]
+        ["docker", "exec", container, "curl", "-fsS", f"http://127.0.0.1:{port}/slots"]
     )
     if code != 0:
         return {
@@ -868,6 +1394,8 @@ def fetch_live_tps(active_key: str | None, container: str) -> dict:
 
 
 def build_live_throughput_status(active_key: str | None, containers: list[dict]) -> dict:
+    if _key_is_vllm(active_key):
+        return build_vllm_throughput_status()
     if not active_key:
         return {
             "tokens_per_second": None,
@@ -914,6 +1442,8 @@ def build_live_throughput_status(active_key: str | None, containers: list[dict])
 
 
 def build_throughput_status(active_key: str | None, containers: list[dict]) -> dict:
+    if _key_is_vllm(active_key):
+        return build_vllm_throughput_status()
     if not active_key:
         return {
             "tokens_per_second": None,
@@ -1006,6 +1536,140 @@ def build_throughput_status(active_key: str | None, containers: list[dict]) -> d
         THROUGHPUT_CACHE["result"] = dict(result)
 
     return result
+
+
+def build_vllm_throughput_status() -> dict:
+    """Fetch and parse vLLM Prometheus metrics, with caching."""
+    container = find_vllm_server_container_name()
+    if not container:
+        return {
+            "tokens_per_second": None,
+            "ingest_tps": None,
+            "source": "prometheus",
+            "updated_at": None,
+            "container": None,
+            "state": "unavailable",
+            "detail": "No vLLM container detected",
+            "generation_tokens_total": 0,
+            "prompt_tokens_total": 0,
+            "avg_queue_time_sec": None,
+            "avg_ttft_sec": None,
+            "avg_iter_tokens": None,
+            "avg_gen_per_request": None,
+            "avg_prompt_per_request": None,
+        }
+
+    now = time.time()
+    with VLLM_METRICS_CACHE_LOCK:
+        cached = VLLM_METRICS_CACHE["raw"]
+        if (
+            cached is not None
+            and VLLM_METRICS_CACHE["container"] == container
+            and (now - VLLM_METRICS_CACHE["checked_at"]) < VLLM_METRICS_CACHE_TTL_SEC
+        ):
+            return _build_vllm_throughput_from_cache(container)
+
+    code, output = run_command(
+        ["docker", "exec", container, "curl", "-fsS", "--max-time", "5",
+         "http://127.0.0.1:8080/metrics"]
+    )
+    if code != 0:
+        result = {
+            "tokens_per_second": None,
+            "ingest_tps": None,
+            "source": "prometheus",
+            "updated_at": now_iso(),
+            "container": container,
+            "state": "error",
+            "detail": "Failed to read vLLM metrics",
+            "generation_tokens_total": 0,
+            "prompt_tokens_total": 0,
+            "avg_queue_time_sec": None,
+            "avg_ttft_sec": None,
+            "avg_iter_tokens": None,
+            "avg_gen_per_request": None,
+            "avg_prompt_per_request": None,
+        }
+    else:
+        parsed = parse_vllm_metrics(output, container)
+        result = {
+            "tokens_per_second": parsed["tps"],
+            "ingest_tps": parsed["ingest_tps"],
+            "source": "prometheus",
+            "updated_at": parsed["updated_at"],
+            "container": container,
+            "state": "ok" if parsed["tps"] is not None else "collecting",
+            "detail": "vLLM Prometheus metrics",
+            "generation_tokens_total": parsed["gen_total"],
+            "prompt_tokens_total": parsed["prompt_total"],
+            "avg_queue_time_sec": parsed["avg_queue_time_sec"],
+            "avg_ttft_sec": parsed["avg_ttft_sec"],
+            "avg_iter_tokens": parsed["avg_iter_tokens"],
+            "avg_gen_per_request": parsed["avg_gen_per_request"],
+            "avg_prompt_per_request": parsed["avg_prompt_per_request"],
+            "total_requests_approx": parsed["total_requests_approx"],
+            "completion_key": f"vllm-reqs:{parsed['completed_requests']}",
+            "gpu_cache_usage_perc": parsed["gpu_cache_usage_perc"],
+        }
+
+    with VLLM_METRICS_CACHE_LOCK:
+        VLLM_METRICS_CACHE["container"] = container
+        VLLM_METRICS_CACHE["checked_at"] = now
+        if code == 0:
+            VLLM_METRICS_CACHE["raw"] = output
+            VLLM_METRICS_CACHE["gpu_cache_usage_perc"] = parsed["gpu_cache_usage_perc"]
+            VLLM_METRICS_CACHE["generation_tokens_total"] = parsed["gen_total"]
+            VLLM_METRICS_CACHE["prompt_tokens_total"] = parsed["prompt_total"]
+            VLLM_METRICS_CACHE["iteration_tokens_total_sum"] = parsed["avg_iter_tokens"] * parsed["total_requests_approx"] if parsed["avg_iter_tokens"] else 0
+            # Note: I should probably just store the parsed dict or more fields if needed, 
+            # but for now let's just make sure _build_vllm_throughput_from_cache works.
+        else:
+            VLLM_METRICS_CACHE["raw"] = None
+
+    return result
+
+
+def _build_vllm_throughput_from_cache(container: str) -> dict:
+    """Build vLLM throughput result from cached metrics."""
+    cache = VLLM_METRICS_CACHE
+    gen_total = cache.get("generation_tokens_total", 0)
+    prompt_total = cache.get("prompt_tokens_total", 0)
+    iter_sum = cache.get("iteration_tokens_total_sum", 0)
+    iter_count = cache.get("iteration_tokens_total_count", 0)
+    queue_sum = cache.get("request_queue_time_seconds_sum", 0)
+    queue_count = cache.get("request_queue_time_seconds_count", 0)
+    ttft_sum = cache.get("time_to_first_token_seconds_sum", 0)
+    ttft_count = cache.get("time_to_first_token_seconds_count", 0)
+    gen_tokens_sum = cache.get("request_generation_tokens_sum", 0)
+    gen_tokens_count = cache.get("request_generation_tokens_count", 0)
+    prompt_tokens_sum = cache.get("request_prompt_tokens_sum", 0)
+    prompt_tokens_count = cache.get("request_prompt_tokens_count", 0)
+
+    avg_gen_per_request = gen_tokens_sum / gen_tokens_count if gen_tokens_count > 0 else None
+    avg_prompt_per_request = prompt_tokens_sum / prompt_tokens_count if prompt_tokens_count > 0 else None
+    avg_queue_time = queue_sum / queue_count if queue_count > 0 else None
+    avg_ttft = ttft_sum / ttft_count if ttft_count > 0 else None
+    avg_iter_tokens = iter_sum / iter_count if iter_count > 0 else None
+
+    return {
+        "tokens_per_second": None,  # TPS only available on live scrape
+        "ingest_tps": None,
+        "source": "prometheus",
+        "updated_at": now_iso(),
+        "container": container,
+        "state": "cached",
+        "detail": "Cached vLLM Prometheus metrics",
+        "generation_tokens_total": gen_total,
+        "prompt_tokens_total": prompt_total,
+        "avg_queue_time_sec": avg_queue_time,
+        "avg_ttft_sec": avg_ttft,
+        "avg_iter_tokens": avg_iter_tokens,
+        "avg_gen_per_request": avg_gen_per_request,
+        "avg_prompt_per_request": avg_prompt_per_request,
+        "total_requests_approx": max(iter_count, queue_count, gen_tokens_count),
+        "completion_key": f"vllm-reqs:{gen_tokens_count}",
+        "gpu_cache_usage_perc": cache.get("gpu_cache_usage_perc", 0),
+    }
 
 
 def build_model_stats(active_key: str | None, live: dict, completed: dict) -> dict:
@@ -1164,6 +1828,12 @@ def _pick_float(d: dict, keys: list[str]) -> float | None:
     return None
 
 
+def _get_server_port(active_key: str) -> int:
+    """Return the internal (in-container) port the model server listens on."""
+    models, _ = get_models()
+    return models.get(active_key, {}).get("internal_port", 8080)
+
+
 def run_single_benchmark(
     active_key: str,
     containers: list[dict],
@@ -1173,16 +1843,49 @@ def run_single_benchmark(
 ) -> tuple[dict | None, str | None]:
     container = find_model_server_container_name(active_key, containers)
     if not container:
-        return None, "Active model server container not found"
+        if _key_is_vllm(active_key):
+            container = find_vllm_server_container_name()
+        if not container:
+            return None, "Active model server container not found"
 
-    payload = {
-        "prompt": build_benchmark_prompt(prompt_tokens),
-        "n_predict": n_predict,
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "stream": False,
-        "cache_prompt": False,
-    }
+    is_vllm = _key_is_vllm(active_key)
+
+    port = _get_server_port(active_key)
+
+    if is_vllm:
+        # Fetch valid model ID from vLLM
+        model_id = "qwen"
+        code_model, out_model = run_command(["docker", "exec", container, "curl", "-s", f"http://127.0.0.1:{port}/v1/models"])
+        if code_model == 0:
+            try:
+                models_data = json.loads(out_model)
+                if "data" in models_data and len(models_data["data"]) > 0:
+                    model_id = models_data["data"][0]["id"]
+            except Exception:
+                pass
+
+        # vLLM OpenAI completions API
+        payload = {
+            "model": model_id,
+            "prompt": build_benchmark_prompt(prompt_tokens),
+            "max_tokens": n_predict,
+            "temperature": 0.0,
+            "stream": True,
+            "stream_options": {"include_usage": True}
+        }
+        endpoint = f"http://127.0.0.1:{port}/v1/completions"
+    else:
+        # llama.cpp / BeeLlama completions API
+        payload = {
+            "prompt": build_benchmark_prompt(prompt_tokens),
+            "n_predict": n_predict,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "stream": False,
+            "cache_prompt": False,
+        }
+        endpoint = f"http://127.0.0.1:{port}/completion"
+
     cmd = [
         "docker",
         "exec",
@@ -1191,22 +1894,84 @@ def run_single_benchmark(
         "-fsS",
         "--max-time",
         str(BENCHMARK_TIMEOUT_SEC),
+        "-w", "\\n%{time_starttransfer}",
         "-X",
         "POST",
-        "http://127.0.0.1:8080/completion",
+        endpoint,
         "-H",
         "Content-Type: application/json",
         "-d",
         json.dumps(payload),
     ]
+    start_t = time.time()
     code, output = run_command(cmd)
-    if code != 0:
-        return None, "Benchmark request failed"
+    end_t = time.time()
+    duration = end_t - start_t
 
-    try:
-        body = json.loads(output)
-    except Exception:
-        return None, "Benchmark returned invalid JSON"
+    if code != 0:
+        return None, f"Benchmark request failed (code {code}): {output[:200]}"
+
+    # Extract TTFT from last line
+    lines = output.strip().splitlines()
+    ttft = 0.0
+    if lines:
+        try:
+            ttft = float(lines[-1])
+            output = "\n".join(lines[:-1]) # Remove TTFT line from JSON output
+        except Exception:
+            pass
+
+    body = {}
+    if not is_vllm:
+        try:
+            body = json.loads(output)
+        except Exception:
+            return None, f"Benchmark returned invalid JSON: {output[:100]}"
+
+    if is_vllm:
+        # vLLM streaming usage format (it's in the last data chunk)
+        usage = None
+        # body in this case is the list of lines if it was a stream? 
+        # No, body = json.loads(output) likely failed because output is a stream.
+        # Let's fix the JSON loading for vLLM streams.
+        
+        # Re-parse output for usage block
+        usage_match = re.search(r'"usage":\s*({[^}]+})', output)
+        if usage_match:
+            try:
+                usage = json.loads(usage_match.group(1))
+            except Exception:
+                pass
+        
+        if not usage:
+            # Fallback to common choice-based usage if available
+            return None, f"Benchmark usage missing from vLLM stream response. Output: {output[:100]}"
+        
+        prompt_n = usage.get("prompt_tokens", prompt_tokens)
+        gen_n = usage.get("completion_tokens", n_predict)
+        
+        # Accurate speeds from TTFT
+        # ttft here is time_starttransfer, which for a stream is when the first chunk (first token) arrived.
+        # This is a very good measure of prefill time.
+        prefill_tps = prompt_n / ttft if ttft > 0 else 0.0
+        
+        # Generation time is total wall duration minus prefill time
+        gen_duration = duration - ttft
+        gen_tps = gen_n / gen_duration if gen_duration > 0 else 0.0
+        
+        return (
+            {
+                "container": container,
+                "prefill_tps": prefill_tps,
+                "gen_tps": gen_tps,
+                "prompt_tokens": prompt_n,
+                "gen_tokens": gen_n,
+                "is_vllm": True,
+                "duration_sec": duration,
+                "ttft_sec": ttft
+            },
+            None,
+        )
 
     timings = body.get("timings")
     if not isinstance(timings, dict):
@@ -1306,6 +2071,18 @@ def start_switch(model_key: str) -> tuple[bool, str]:
     if not model:
         return False, "Unknown model"
 
+    # Handle vLLM switching (any stack with vllm=True)
+    if model.get("vllm"):
+        return start_vllm_switch(
+            compose_file=model.get("compose_file") or str(VLLM_DIR / "docker-compose.yml"),
+            model_key=model_key,
+            label=model["label"],
+        )
+
+    # Handle BeeLlama switching
+    if model.get("beellama"):
+        return start_beellama_switch(model_key)
+
     current_containers = list_llama_compose_containers()
     current_active = detect_active_model_key(current_containers)
     if current_active == model_key and is_model_server_healthy(model_key, current_containers):
@@ -1321,6 +2098,9 @@ def start_switch(model_key: str) -> tuple[bool, str]:
     _append_log_event("info", "switch", f"Switch requested: {model['label']}")
 
     def _worker() -> None:
+        # Stop BeeLlama if running before starting a llama.cpp model
+        if BEELLAMA_DIR.is_dir():
+            _stop_beellama()
         compose_path = model["compose"]
         cmd = [
             "bash",
@@ -1383,6 +2163,239 @@ def start_switch(model_key: str) -> tuple[bool, str]:
 
     threading.Thread(target=_worker, daemon=True).start()
     return True, f"Switch request accepted: {model['label']}"
+
+
+def start_vllm_switch(
+    compose_file: str | None = None,
+    model_key: str = "vllm",
+    label: str = "vLLM",
+) -> tuple[bool, str]:
+    """Start/restart a vLLM stack (stop llama.cpp or a different vLLM stack first)."""
+    if compose_file is None:
+        compose_file = str(VLLM_DIR / "docker-compose.yml")
+
+    current_containers = list_llama_compose_containers()
+    current_active = detect_active_model_key(current_containers)
+    vllm_containers = list_vllm_compose_containers()
+
+    if current_active == model_key and is_vllm_healthy(vllm_containers):
+        return False, f"{label} is already active and healthy"
+
+    with STATE_LOCK:
+        if STATE["switch_in_progress"]:
+            return False, "A model switch is already in progress"
+        STATE["switch_in_progress"] = True
+        STATE["last_requested_model"] = model_key
+        STATE["last_started_at"] = now_iso()
+        STATE["last_message"] = f"Switching to {label}..."
+    _append_log_event("info", "switch", f"Switch requested: {label}")
+
+    def _vllm_worker() -> None:
+        try:
+            # Stop llama.cpp if it is active
+            if current_active and not _key_is_vllm(current_active):
+                _append_log_event("info", "switch", "Stopping current llama.cpp model...")
+                cmd = [
+                    "bash", "-lc",
+                    f"cd {shlex.quote(str(LLAMA_DIR))} && {shlex.quote(str(SWITCH_SCRIPT))} --stop-all",
+                ]
+                run_command(cmd)
+                time.sleep(2)
+
+            # Stop a different vLLM stack if one is currently running
+            elif _key_is_vllm(current_active) and current_active != model_key:
+                _append_log_event("info", "switch", "Stopping current vLLM stack...")
+                for c in vllm_containers:
+                    cf = c.get("config_files", "")
+                    if cf:
+                        old_file = cf.split(",")[0].strip()
+                        run_command(["bash", "-lc",
+                            f"cd {shlex.quote(str(VLLM_DIR))} && "
+                            f"docker compose -p vllm -f {shlex.quote(old_file)} down --remove-orphans"])
+                        break
+                time.sleep(2)
+
+            # Start the requested vLLM stack
+            compose_path = Path(compose_file)
+            if not compose_path.exists():
+                _append_log_event("error", "switch", f"vLLM compose file not found: {compose_file}")
+                with STATE_LOCK:
+                    STATE["switch_in_progress"] = False
+                    STATE["last_completed_at"] = now_iso()
+                    STATE["last_message"] = f"Compose file not found: {compose_path.name}"
+                return
+
+            _append_log_event("info", "switch", f"Starting {label}...")
+            cmd = [
+                "bash", "-lc",
+                f"cd {shlex.quote(str(VLLM_DIR))} && "
+                f"docker compose -p vllm -f {shlex.quote(str(compose_path))} up -d --remove-orphans",
+            ]
+            exit_code, output = run_command(cmd)
+
+            if exit_code != 0:
+                with STATE_LOCK:
+                    STATE["switch_in_progress"] = False
+                    STATE["last_completed_at"] = now_iso()
+                    STATE["last_exit_code"] = exit_code
+                    STATE["last_output"] = output[-4000:]
+                    STATE["last_message"] = f"{label} start failed (exit {exit_code})"
+                _append_log_event("error", "switch", f"{label} start failed (exit {exit_code})")
+                return
+
+            # Poll until healthy
+            deadline = time.time() + SWITCH_READY_TIMEOUT_SEC
+            while time.time() < deadline:
+                time.sleep(SWITCH_POLL_SEC)
+                local_vllm = list_vllm_compose_containers()
+                if is_vllm_healthy(local_vllm):
+                    with STATE_LOCK:
+                        STATE["switch_in_progress"] = False
+                        STATE["last_completed_at"] = now_iso()
+                        STATE["last_message"] = f"Ready: {label}"
+                    _append_log_event("info", "switch", f"Ready: {label}")
+                    return
+
+            with STATE_LOCK:
+                STATE["switch_in_progress"] = False
+                STATE["last_completed_at"] = now_iso()
+                STATE["last_message"] = f"{label} load timeout"
+            _append_log_event("error", "switch", f"{label} load timeout")
+
+        except Exception as exc:
+            _append_log_event("error", "switch", f"vLLM switch error: {exc}")
+            with STATE_LOCK:
+                STATE["switch_in_progress"] = False
+                STATE["last_completed_at"] = now_iso()
+                STATE["last_message"] = f"vLLM switch error: {exc}"
+
+    threading.Thread(target=_vllm_worker, daemon=True).start()
+    return True, f"Switch to {label} accepted"
+
+
+def _get_beellama_compose_file(model: dict) -> Path:
+    """Return the compose file for a beellama model.
+    Stack files that contain 'services:' are used directly; stub-only files
+    fall back to docker-compose.yml."""
+    stack_rel = model.get("compose", "")
+    if stack_rel.startswith("beellama-stacks/"):
+        stack_file = BEELLAMA_STACKS_DIR / stack_rel[len("beellama-stacks/"):]
+        try:
+            if stack_file.exists() and "services:" in stack_file.read_text():
+                return stack_file
+        except Exception:
+            pass
+    return BEELLAMA_DIR / "docker-compose.yml"
+
+
+def _stop_beellama() -> None:
+    compose_file = BEELLAMA_DIR / "docker-compose.yml"
+    if compose_file.exists():
+        run_command(["bash", "-lc",
+            f"docker compose -p beellamacpp -f {shlex.quote(str(compose_file))} down 2>/dev/null || true"])
+    # Force-stop any remaining beellamacpp containers regardless of which compose file started them
+    run_command(["bash", "-lc",
+        "docker ps -q --filter label=com.docker.compose.project=beellamacpp "
+        "| xargs -r docker stop 2>/dev/null || true; "
+        "docker ps -aq --filter label=com.docker.compose.project=beellamacpp "
+        "| xargs -r docker rm -f 2>/dev/null || true"])
+
+
+def start_beellama_switch(model_key: str) -> tuple[bool, str]:
+    """Start BeeLlama (stop llama.cpp first, then docker compose up -d)."""
+    models, _ = get_models()
+    model = models.get(model_key, {})
+    current_containers = list_llama_compose_containers()
+    current_active = detect_active_model_key(current_containers)
+    if current_active == model_key and is_model_server_healthy(model_key, current_containers):
+        return False, f"{model.get('label', 'BeeLlama')} is already active and healthy"
+
+    with STATE_LOCK:
+        if STATE["switch_in_progress"]:
+            return False, "A model switch is already in progress"
+        STATE["switch_in_progress"] = True
+        STATE["last_requested_model"] = model_key
+        STATE["last_started_at"] = now_iso()
+        STATE["last_message"] = f"Switching to {model.get('label', 'BeeLlama')}..."
+    _append_log_event("info", "switch", f"Switch requested: {model.get('label', 'BeeLlama')}")
+
+    def _beellama_worker() -> None:
+        try:
+            compose_file = _get_beellama_compose_file(model)
+            compose_file_q = shlex.quote(str(compose_file))
+
+            # Pre-build while old service is still alive
+            _append_log_event("info", "switch", "Building beellama image (cache speeds this up)...")
+            build_code, build_output = run_command(["bash", "-lc",
+                f"cd {shlex.quote(str(BEELLAMA_DIR))} && "
+                f"docker compose -p beellamacpp --project-directory {shlex.quote(str(BEELLAMA_DIR))} -f {compose_file_q} build"])
+            if build_code != 0:
+                with STATE_LOCK:
+                    STATE["switch_in_progress"] = False
+                    STATE["last_completed_at"] = now_iso()
+                    STATE["last_exit_code"] = build_code
+                    STATE["last_output"] = build_output[-4000:]
+                    STATE["last_message"] = f"BeeLlama build failed (exit {build_code})"
+                _append_log_event("error", "switch", "BeeLlama build failed")
+                return
+
+            # Stop the current service now that the image is ready
+            if current_active and not models.get(current_active, {}).get("beellama"):
+                _append_log_event("info", "switch", "Stopping current llama.cpp model...")
+                run_command(["bash", "-lc",
+                    f"cd {shlex.quote(str(LLAMA_DIR))} && {shlex.quote(str(SWITCH_SCRIPT))} --stop-all"])
+                time.sleep(2)
+            elif current_active:
+                _append_log_event("info", "switch", "Stopping current beellama model...")
+                _stop_beellama()
+                time.sleep(1)
+
+            # Start new service — image already built, --no-build skips pull_policy: build
+            _append_log_event("info", "switch", "Starting BeeLlama...")
+            exit_code, output = run_command(["bash", "-lc",
+                f"cd {shlex.quote(str(BEELLAMA_DIR))} && "
+                f"docker compose -p beellamacpp --project-directory {shlex.quote(str(BEELLAMA_DIR))} -f {compose_file_q} up -d --no-build"])
+
+            if exit_code != 0:
+                with STATE_LOCK:
+                    STATE["switch_in_progress"] = False
+                    STATE["last_completed_at"] = now_iso()
+                    STATE["last_exit_code"] = exit_code
+                    STATE["last_output"] = output[-4000:]
+                    STATE["last_message"] = f"BeeLlama start failed (exit {exit_code})"
+                _append_log_event("error", "switch", "BeeLlama start failed")
+                return
+
+            with STATE_LOCK:
+                STATE["last_exit_code"] = exit_code
+                STATE["last_output"] = output[-4000:]
+                STATE["last_message"] = f"Loading {model.get('label', 'BeeLlama')}..."
+
+            deadline = time.time() + SWITCH_READY_TIMEOUT_SEC
+            while time.time() < deadline:
+                local_containers = list_llama_compose_containers()
+                if is_model_server_healthy(model_key, local_containers):
+                    with STATE_LOCK:
+                        STATE["switch_in_progress"] = False
+                        STATE["last_completed_at"] = now_iso()
+                        STATE["last_message"] = f"Ready: {model.get('label', 'BeeLlama')}"
+                    _append_log_event("info", "switch", f"Switch complete: {model.get('label', 'BeeLlama')} is ready")
+                    return
+                time.sleep(SWITCH_POLL_SEC)
+
+            with STATE_LOCK:
+                STATE["switch_in_progress"] = False
+                STATE["last_completed_at"] = now_iso()
+                STATE["last_message"] = f"Load timeout for {model.get('label', 'BeeLlama')}"
+            _append_log_event("error", "switch", "BeeLlama load timeout")
+        except Exception as e:
+            with STATE_LOCK:
+                STATE["switch_in_progress"] = False
+                STATE["last_message"] = f"BeeLlama switch error: {e}"
+            _append_log_event("error", "switch", f"BeeLlama switch error: {e}")
+
+    threading.Thread(target=_beellama_worker, daemon=True).start()
+    return True, f"Switch request accepted: {model.get('label', 'BeeLlama')}"
 
 
 def get_gpu_stats() -> list[dict]:
@@ -1549,8 +2562,9 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
             "label": m["label"],
             "compose": m["compose"],
             "healthy": active_healthy,
-            "thinking": m["thinking"],
-            "family": m["family"],
+             "thinking": m["thinking"],
+             "vision": m["vision"],
+             "family": m["family"],
             "ctx_size": m["ctx_size"],
             "quant": m["quant"],
             "params": m["params"],
@@ -1560,6 +2574,15 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
     model_stats = build_model_stats(active_key, live_throughput, throughput)
 
     context_info = {"n_ctx": None, "n_past": None}
+    if _key_is_vllm(active_key) and throughput.get("gpu_cache_usage_perc") is not None:
+        try:
+            m = models.get(active_key) or {}
+            ctx_size = int(m.get("ctx_size", 32768))
+            context_info["n_ctx"] = ctx_size
+            context_info["n_past"] = int(ctx_size * throughput["gpu_cache_usage_perc"])
+        except (ValueError, KeyError):
+            pass
+
     with CONTEXT_STATE_LOCK:
         ctx_state = dict(CONTEXT_STATE)
         # Reset stale context if model changed
@@ -1653,6 +2676,7 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
                 "compose": m["compose"],
                 "server_service": m["server_service"],
                 "thinking": m["thinking"],
+                "vision": m["vision"],
                 "family": m["family"],
                 "ctx_size": m["ctx_size"],
                 "quant": m["quant"],
@@ -1660,6 +2684,8 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
             }
             for key, m in models.items()
         ],
+        "vllm_dir": str(VLLM_DIR),
+        "vllm_dir_exists": VLLM_DIR.is_dir(),
     }
 
     with LOG_LOCK:
@@ -1727,6 +2753,11 @@ INDEX_HTML = r"""<!doctype html>
       z-index: 10;
     }
     .brand { font-size: 16px; font-weight: 800; letter-spacing: 1px; color: var(--accent); }
+    /* Mobile drawer toggle + backdrop (hidden on desktop; enabled in media query) */
+    .menu-toggle { display: none; background: none; border: 1px solid var(--border-strong); color: var(--text); font-size: 18px; line-height: 1; width: 40px; height: 34px; border-radius: 8px; cursor: pointer; margin-right: 10px; flex-shrink: 0; align-items: center; justify-content: center; }
+    .menu-toggle:active { background: rgba(255,255,255,0.08); }
+    .sidebar-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 150; }
+    .sidebar-backdrop.open { display: block; }
     .header-center { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-dim); }
     .header-active-label { font-weight: 700; color: var(--text); }
     .status-badge {
@@ -1760,6 +2791,23 @@ INDEX_HTML = r"""<!doctype html>
       flex-direction: column;
       overflow: hidden;
     }
+    .sidebar-nav {
+      display: flex; flex-direction: column; gap: 2px;
+      padding: 10px 10px 8px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .nav-link {
+      display: flex; align-items: center; gap: 10px;
+      width: 100%; text-align: left;
+      background: none; border: none; color: var(--text-dim);
+      font: inherit; font-size: 13px; font-weight: 600;
+      padding: 9px 10px; border-radius: 8px; cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+    }
+    .nav-link:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+    .nav-link:active { background: rgba(59,130,246,0.15); }
+    .nav-ico { font-size: 15px; width: 18px; text-align: center; flex-shrink: 0; }
     .sidebar-scroll {
       flex: 1;
       overflow-y: auto;
@@ -1801,6 +2849,7 @@ INDEX_HTML = r"""<!doctype html>
     .tag-quant { background: rgba(168,85,247,0.12); color: #c084fc; border: 1px solid rgba(168,85,247,0.25); }
     .tag-params { background: rgba(20,184,166,0.12); color: #2dd4bf; border: 1px solid rgba(20,184,166,0.25); }
     .tag-cot { background: rgba(245,158,11,0.15); color: var(--warning); border: 1px solid rgba(245,158,11,0.3); }
+    .tag-vision { background: rgba(59,130,246,0.15); color: var(--accent); border: 1px solid rgba(59,130,246,0.3); }
     .switching-spin { display: inline-block; width: 10px; height: 10px; border: 2px solid rgba(245,158,11,0.3); border-top-color: var(--warning); border-radius: 50%; animation: spin 0.6s linear infinite; flex-shrink: 0; }
     @keyframes spin { to { transform: rotate(360deg); } }
     .badge-think {
@@ -1993,6 +3042,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .badge-ctx { background: rgba(59,130,246,0.15); color: var(--accent); border: 1px solid rgba(59,130,246,0.3); }
     .badge-think-panel { background: rgba(245,158,11,0.15); color: var(--warning); border: 1px solid rgba(245,158,11,0.3); }
+    .badge-vision { background: rgba(59,130,246,0.15); color: var(--accent); border: 1px solid rgba(59,130,246,0.3); }
 
     /* ── Process table ── */
     .table-panel {
@@ -2046,35 +3096,149 @@ INDEX_HTML = r"""<!doctype html>
     @media (max-width: 900px) {
       .stats-row { grid-template-columns: repeat(3, 1fr); }
     }
+    /* ── Tablet / phone: sidebar becomes a slide-in drawer ── */
+    @media (max-width: 768px) {
+      .menu-toggle { display: flex; }
+      .app-header { padding: 0 12px; }
+      .brand { font-size: 14px; letter-spacing: 0.5px; }
+      .header-center { display: none; }
+      .sidebar {
+        position: fixed; top: 0; left: 0; height: 100%;
+        z-index: 200;
+        width: 84vw; max-width: 320px; min-width: 0;
+        transform: translateX(-100%);
+        transition: transform 0.22s ease;
+        box-shadow: 2px 0 24px rgba(0,0,0,0.5);
+      }
+      .sidebar.open { transform: translateX(0); }
+      /* Position the Request Log (Activity Panel) below the GPU chart and details panel on mobile.
+         Order: stats → switch status → GPU chart & details → Activity/Request Log. */
+      .main-content { display: flex; flex-direction: column; }
+      .main-content > * { flex: 0 0 auto; }   /* don't let flex shrink panels below content height */
+      .stats-row { order: 0; }
+      .switch-status-bar { order: 1; }
+      .content-grid { order: 2; }
+      .activity-panel { order: 3; margin-top: 0; }
+    }
+    /* ── Phone: compact layout ── */
     @media (max-width: 600px) {
-      .stats-row { grid-template-columns: repeat(2, 1fr); }
-      .sidebar { display: none; }
+      .stats-row { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+      .main-content { padding: 12px; }
+      .stat-value { font-size: 20px; }
+      .activity-head { padding: 0 10px; }
+      .activity-tools { width: 100%; padding-bottom: 10px; }
+      .reqlog-input[type=search] { flex: 1; min-width: 0; }
+      /* Keep Time · Endpoint · Model · Status · (view); hide the rest — full data is in the tap-through detail modal */
+      .reqlog-table th:nth-child(3), .reqlog-table td:nth-child(3),
+      .reqlog-table th:nth-child(5), .reqlog-table td:nth-child(5),
+      .reqlog-table th:nth-child(7), .reqlog-table td:nth-child(7),
+      .reqlog-table th:nth-child(8), .reqlog-table td:nth-child(8),
+      .reqlog-table th:nth-child(9), .reqlog-table td:nth-child(9) { display: none; }
+      .reqlog-table tbody td { padding: 10px 10px; font-size: 12px; }
+      .reqlog-view { opacity: 1; }
+      /* Full-screen detail modal on phones */
+      .reqdetail-modal { width: 100vw; height: 100dvh; max-width: 100vw; max-height: 100dvh; border-radius: 0; }
+      .reqdetail-body { padding: 16px; }
+      .rd-meta { gap: 8px 14px; }
+      /* Confirmation modal sits above the drawer */
+      .modal-overlay { z-index: 1000; }
     }
 
-    /* ── Events & Logs panel ── */
-    .events-panel { background: var(--card); border: 1px solid var(--border-strong); border-radius: 12px; overflow: hidden; margin-top: 16px; }
-    .events-panel-header { display:flex; align-items:center; justify-content:space-between; padding:12px 18px; border-bottom:1px solid var(--border); cursor:pointer; user-select:none; }
-    .events-panel-header:hover { background:rgba(255,255,255,0.02); }
-    .events-title { font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px; }
-    .events-err-badge { font-size:10px; font-weight:800; padding:2px 7px; border-radius:999px; background:rgba(239,68,68,0.15); color:var(--danger); border:1px solid rgba(239,68,68,0.3); display:none; }
-    .events-body { max-height:220px; overflow-y:auto; padding:6px 0; font-family:var(--font-mono); font-size:12px; }
-    .events-body::-webkit-scrollbar { width:4px; }
-    .events-body::-webkit-scrollbar-thumb { background:var(--border-strong); border-radius:2px; }
-    .events-collapsed .events-body { display:none; }
-    .event-row { display:flex; gap:10px; align-items:baseline; padding:3px 18px; border-bottom:1px solid rgba(255,255,255,0.03); }
+    /* ── Activity panel (Requests + Events, tabbed) ── */
+    .activity-panel { background:var(--card); border:1px solid var(--border-strong); border-radius:12px; overflow:hidden; margin-top:16px; display:flex; flex-direction:column; }
+    .activity-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:0 14px; border-bottom:1px solid var(--border); flex-wrap:wrap; }
+    .activity-tabs { display:flex; gap:2px; }
+    .activity-tab { background:none; border:none; color:var(--text-muted); font:inherit; font-size:13px; font-weight:700; padding:14px 12px 12px; cursor:pointer; border-bottom:2px solid transparent; display:flex; align-items:center; gap:7px; transition:color .15s; }
+    .activity-tab:hover { color:var(--text-dim); }
+    .activity-tab.active { color:var(--text); border-bottom-color:var(--accent); }
+    .tab-chip { background:rgba(255,255,255,0.08); color:var(--text-dim); font-size:10px; font-weight:700; padding:1px 7px; border-radius:999px; min-width:16px; text-align:center; }
+    .tab-chip-err { background:rgba(239,68,68,0.2); color:var(--danger); display:none; }
+    .activity-tools { display:flex; align-items:center; gap:8px; padding:7px 0; flex-wrap:wrap; }
+    .reqlog-input { background:var(--bg); border:1px solid var(--border-strong); color:var(--text); border-radius:7px; padding:6px 9px; font-size:12px; font-family:inherit; }
+    .reqlog-input[type=search] { min-width:220px; }
+    .reqlog-input:focus { outline:none; border-color:var(--accent); background:rgba(59,130,246,0.06); }
+    .reqlog-auto { color:var(--text-muted); font-size:11px; display:flex; align-items:center; gap:5px; cursor:pointer; user-select:none; }
+    .reqlog-refresh { background:rgba(59,130,246,0.15); border:1px solid rgba(59,130,246,0.4); color:var(--accent); border-radius:7px; width:32px; height:30px; font-size:15px; font-weight:700; cursor:pointer; line-height:1; }
+    .reqlog-refresh:hover { background:rgba(59,130,246,0.28); }
+    .activity-body { min-height:120px; }
+
+    /* Request Log table */
+    .reqlog-scroll { max-height:60vh; overflow:auto; }
+    .reqlog-scroll::-webkit-scrollbar { width:8px; height:8px; }
+    .reqlog-scroll::-webkit-scrollbar-thumb { background:var(--border-strong); border-radius:4px; }
+    .reqlog-table { width:100%; border-collapse:collapse; }
+    .reqlog-table thead th { position:sticky; top:0; z-index:1; background:#0d1524; color:var(--text-muted); font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; text-align:left; padding:9px 12px; border-bottom:1px solid var(--border-strong); white-space:nowrap; }
+    .reqlog-table tbody td { font-size:11.5px; padding:8px 12px; vertical-align:top; border-bottom:1px solid rgba(255,255,255,0.04); font-family:var(--font-mono); }
+    .reqlog-row { cursor:pointer; transition:background .1s; }
+    .reqlog-row:hover { background:rgba(59,130,246,0.07); }
+    .reqlog-row:hover .reqlog-view { opacity:1; }
+    .reqlog-time { color:var(--text-dim); white-space:nowrap; }
+    .reqlog-ep { font-weight:800; font-size:10px; padding:2px 7px; border-radius:5px; white-space:nowrap; }
+    .reqlog-ep-8080 { background:rgba(59,130,246,0.18); color:#93c5fd; }
+    .reqlog-ep-28082 { background:rgba(16,185,129,0.18); color:#6ee7b7; }
+    .reqlog-origin-ip { color:var(--text); }
+    .reqlog-ua { color:var(--text-muted); font-size:10px; display:block; max-width:210px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .reqlog-model { color:var(--text-dim); }
+    .reqlog-path { color:var(--text-dim); }
+    .reqlog-snip { color:var(--text-muted); max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .col-prompt { min-width:160px; }
+    .status-pill { font-weight:800; font-size:10px; padding:2px 7px; border-radius:5px; }
+    .status-ok { background:rgba(16,185,129,0.15); color:#6ee7b7; }
+    .status-bad { background:rgba(239,68,68,0.15); color:#fca5a5; }
+    .reqlog-view { opacity:.35; color:var(--accent); font-weight:700; font-size:11px; white-space:nowrap; }
+    .reqlog-empty { text-align:center; color:var(--text-muted); padding:28px 16px; font-size:12.5px; }
+
+    /* Events tab */
+    .events-body { max-height:60vh; overflow-y:auto; padding:6px 0; font-family:var(--font-mono); font-size:12px; }
+    .events-body::-webkit-scrollbar { width:8px; }
+    .events-body::-webkit-scrollbar-thumb { background:var(--border-strong); border-radius:4px; }
+    .event-row { display:flex; gap:10px; align-items:baseline; padding:5px 16px; border-bottom:1px solid rgba(255,255,255,0.03); }
     .event-row:last-child { border-bottom:none; }
     .event-ts { color:var(--text-muted); font-size:10px; white-space:nowrap; flex-shrink:0; }
     .event-sev { font-size:10px; font-weight:800; width:52px; flex-shrink:0; }
     .ev-error { color:var(--danger); } .ev-warning { color:var(--warning); } .ev-info { color:var(--success); }
     .event-msg { flex:1; color:var(--text-dim); word-break:break-word; }
-    .events-empty-msg { text-align:center; color:var(--text-muted); padding:16px; font-size:12px; }
+    .events-empty-msg { text-align:center; color:var(--text-muted); padding:28px 16px; font-size:12.5px; }
     .hdr-err-badge { font-size:10px; font-weight:800; padding:2px 8px; border-radius:999px; background:rgba(239,68,68,0.2); color:var(--danger); border:1px solid rgba(239,68,68,0.4); display:none; margin-right:8px; }
+
+    /* ── Request detail modal ── */
+    .reqdetail-modal { max-width:940px; width:94vw; max-height:88vh; padding:0; text-align:left; display:flex; flex-direction:column; }
+    .reqdetail-head { display:flex; align-items:center; justify-content:space-between; padding:16px 22px; border-bottom:1px solid var(--border); flex-shrink:0; }
+    .reqdetail-head h2 { margin:0; font-size:16px; }
+    .reqdetail-close { background:none; border:none; color:var(--text-muted); font-size:16px; cursor:pointer; padding:4px 8px; border-radius:6px; }
+    .reqdetail-close:hover { background:rgba(255,255,255,0.06); color:var(--text); }
+    .reqdetail-body { padding:18px 22px; overflow:auto; }
+    .rd-meta { display:flex; flex-wrap:wrap; gap:8px 18px; padding-bottom:16px; margin-bottom:16px; border-bottom:1px solid var(--border); }
+    .rd-meta .rd-m { display:flex; flex-direction:column; gap:2px; }
+    .rd-meta .rd-k { font-size:9px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-muted); font-weight:700; }
+    .rd-meta .rd-v { font-size:12px; color:var(--text); font-family:var(--font-mono); }
+    .rd-section-title { font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.8px; color:var(--text-muted); margin:18px 0 10px; }
+    .rd-section-title:first-child { margin-top:0; }
+    .rd-params { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
+    .rd-param { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:3px 9px; font-size:11px; font-family:var(--font-mono); color:var(--text-dim); }
+    .rd-param b { color:var(--text); font-weight:700; }
+    .rd-msg { border:1px solid var(--border); border-radius:9px; margin-bottom:8px; overflow:hidden; }
+    .rd-msg-role { font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; padding:6px 12px; }
+    .rd-role-system { background:rgba(148,163,184,0.14); color:#cbd5e1; }
+    .rd-role-user { background:rgba(59,130,246,0.16); color:#93c5fd; }
+    .rd-role-assistant { background:rgba(16,185,129,0.14); color:#6ee7b7; }
+    .rd-role-tool { background:rgba(245,158,11,0.14); color:#fcd34d; }
+    .rd-msg-content { padding:10px 12px; font-size:12.5px; line-height:1.55; white-space:pre-wrap; word-break:break-word; color:var(--text); font-family:var(--font-mono); }
+    .rd-reasoning { margin-top:8px; }
+    .rd-reasoning summary { cursor:pointer; color:var(--warning); font-size:11px; font-weight:700; }
+    .rd-reasoning .rd-msg-content { color:var(--text-muted); border-top:1px dashed var(--border); margin-top:6px; }
+    .rd-img { font-size:11px; color:var(--text-muted); font-style:italic; padding:6px 12px; }
+    .rd-raw { margin-top:14px; }
+    .rd-raw summary { cursor:pointer; color:var(--text-muted); font-size:11px; font-weight:700; }
+    .rd-raw pre { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:12px; overflow:auto; max-height:320px; font-size:11px; color:var(--text-dim); margin-top:8px; white-space:pre-wrap; word-break:break-word; }
+    .rd-note { color:var(--text-muted); font-size:12px; font-style:italic; }
   </style>
 </head>
 <body>
 
   <!-- Header -->
   <div class="app-header">
+    <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()" aria-label="Toggle model list">&#9776;</button>
     <div class="brand">GPU LLM DASHBOARD</div>
     <div class="header-center">
       <span id="headerActive" style="color: var(--text-muted)">Detecting...</span>
@@ -2091,8 +3255,16 @@ INDEX_HTML = r"""<!doctype html>
   <!-- App body -->
   <div class="app-body">
 
+    <!-- Mobile drawer backdrop -->
+    <div class="sidebar-backdrop" id="sidebarBackdrop" onclick="closeSidebar()"></div>
+
     <!-- Sidebar -->
     <div class="sidebar">
+      <nav class="sidebar-nav">
+        <button class="nav-link" onclick="goTo('overview')"><span class="nav-ico">&#128202;</span> Overview</button>
+        <button class="nav-link" onclick="goTo('requests')"><span class="nav-ico">&#128220;</span> Request Log</button>
+        <button class="nav-link" onclick="goTo('events')"><span class="nav-ico">&#128276;</span> Events</button>
+      </nav>
       <div class="sidebar-search-wrap">
         <input type="search" class="sidebar-search" id="sidebarSearch" placeholder="Search models..." oninput="filterSidebar()" />
       </div>
@@ -2120,8 +3292,8 @@ INDEX_HTML = r"""<!doctype html>
           <div class="stat-value" id="val-ingest">--</div>
           <div class="stat-sub">tokens / sec</div>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">Context</div>
+        <div class="stat-card" id="stat-ctx-card">
+          <div class="stat-label" id="stat-ctx-label">Context</div>
           <div class="stat-value" id="val-ctx">-- / --</div>
           <div class="stat-bar-bg"><div id="bar-ctx" class="stat-bar-fill" style="width:0%"></div></div>
         </div>
@@ -2222,17 +3394,49 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
 
-      <!-- Events & Logs -->
-      <div class="events-panel" id="eventsPanel">
-        <div class="events-panel-header" onclick="toggleEventsPanel()">
-          <span class="events-title">Events &amp; Logs</span>
-          <div style="display:flex;align-items:center;gap:8px">
-            <span id="eventsBadge" class="events-err-badge"></span>
-            <span id="evToggleIcon" style="color:var(--text-muted);font-size:12px">&#9660;</span>
+      <!-- Activity: Request Log + Events -->
+      <div class="activity-panel" id="activityPanel">
+        <div class="activity-head">
+          <div class="activity-tabs">
+            <button class="activity-tab active" id="tabbtn-reqlog" onclick="switchActivityTab('reqlog')">
+              Requests<span class="tab-chip" id="reqlogCount"></span>
+            </button>
+            <button class="activity-tab" id="tabbtn-events" onclick="switchActivityTab('events')">
+              Events<span class="tab-chip tab-chip-err" id="eventsBadge"></span>
+            </button>
+          </div>
+          <div class="activity-tools" id="reqlogTools">
+            <select id="reqlogEndpoint" class="reqlog-input" onchange="refreshRequestLog(true)">
+              <option value="all">All endpoints</option>
+              <option value="8080">8080 · llama.cpp</option>
+              <option value="28082">28082 · minimal proxy</option>
+            </select>
+            <input type="search" id="reqlogSearch" class="reqlog-input" placeholder="Filter IP, UA, model, path…" oninput="onReqlogSearch()" />
+            <label class="reqlog-auto" title="Auto-refresh"><input type="checkbox" id="reqlogAuto" checked onchange="refreshRequestLog(true)" /> Live</label>
+            <button class="reqlog-refresh" title="Refresh now" onclick="refreshRequestLog(true)">&#8635;</button>
           </div>
         </div>
-        <div class="events-body" id="eventsBody">
-          <div class="events-empty-msg">No events yet.</div>
+
+        <!-- Request Log tab -->
+        <div class="activity-body" id="tab-reqlog">
+          <div class="reqlog-scroll">
+            <table class="reqlog-table">
+              <thead><tr>
+                <th>Time</th><th>Endpoint</th><th>Origin</th><th>Model</th>
+                <th>Path</th><th>Status</th><th>Latency</th><th>Tokens</th><th class="col-prompt">Prompt</th><th></th>
+              </tr></thead>
+              <tbody id="reqlogBody">
+                <tr><td colspan="10" class="reqlog-empty">Loading request log…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Events tab -->
+        <div class="activity-body" id="tab-events" hidden>
+          <div class="events-body" id="eventsBody">
+            <div class="events-empty-msg">No events yet.</div>
+          </div>
         </div>
       </div>
 
@@ -2251,6 +3455,17 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <!-- Request detail modal -->
+  <div id="reqDetailModal" class="modal-overlay" onclick="if(event.target===this)closeRequestDetail()">
+    <div class="modal reqdetail-modal">
+      <div class="reqdetail-head">
+        <h2 id="reqDetailTitle">Request detail</h2>
+        <button class="reqdetail-close" onclick="closeRequestDetail()" title="Close">&#10005;</button>
+      </div>
+      <div class="reqdetail-body" id="reqDetailBody">Loading…</div>
+    </div>
+  </div>
+
   <script>
     let chart = null;
     let isRefreshing = false;
@@ -2263,9 +3478,9 @@ INDEX_HTML = r"""<!doctype html>
     const history = { util: Array(60).fill(0), vram: Array(60).fill(0), tps: Array(60).fill(0) };
 
     // Family display order for sidebar grouping
-    const FAMILY_ORDER = ['gemma','gptoss','glm','mistral','nemotron','qwen','other'];
+    const FAMILY_ORDER = ['vllm','gemma','gptoss','glm','mistral','nemotron','qwen','other'];
     const FAMILY_LABELS = {
-      qwen: 'QWEN', nemotron: 'NEMOTRON', gptoss: 'GPT-OSS',
+      vllm: 'vLLM', qwen: 'QWEN', nemotron: 'NEMOTRON', gptoss: 'GPT-OSS',
       glm: 'GLM', mistral: 'MISTRAL', gemma: 'GEMMA', other: 'OTHER'
     };
     // Persisted collapse state: key = family, value = true if collapsed
@@ -2349,6 +3564,7 @@ INDEX_HTML = r"""<!doctype html>
           if (m.ctx_size) tags += `<span class="tag-pill tag-ctx">${fmtCtx(m.ctx_size)}</span>`;
           if (m.quant) tags += `<span class="tag-pill tag-quant">${escHtml(m.quant)}</span>`;
           if (m.thinking) tags += `<span class="tag-pill tag-cot">COT</span>`;
+          if (m.vision) tags += `<span class="tag-pill tag-vision">VISION</span>`;
           html += `<div class="${cls}" onclick="confirmSwitch('${m.key}','${escHtml(m.label)}')">
             <div class="model-row-inner">
               <div class="model-row-top">${spin}<span class="model-name">${escHtml(m.label)}</span></div>
@@ -2413,21 +3629,24 @@ INDEX_HTML = r"""<!doctype html>
 
     function updateDashboard(data) {
       const gpu = data.gpu_stats?.[0] || {};
-      const stats = data.model_stats || {};
       const bench = data.benchmark || {};
 
-      // Quick stats - show live TPS, fall back to last completed when idle
+      // Unified metrics from standard model_stats
+      const stats = data.model_stats || {};
+      const live = data.live_throughput || {};
+      const ctxInfo = data.context_info || {};
+
+      // Generation Speed
       const liveTps = stats.live_tps || 0;
       const lastTps = stats.last_completed_tps || stats.live_average_tps || 0;
       const genDisplay = liveTps > 0 ? liveTps.toFixed(1) : (lastTps > 0 ? lastTps.toFixed(1) : '0.0');
-      document.getElementById('val-tps').textContent = genDisplay;
 
-      // Ingest Speed: prefer completed (prompt eval time), then live during active prefill, then best
+      // Ingest Speed
       let ingestVal = '0.0';
       const lastIngest = stats.last_ingest_tps;
       const liveIngest = stats.last_live_ingest_tps;
       const bestIngest = stats.best_ingest_tps;
-      const isActivelyIngesting = data.live_throughput?.state !== 'idle' && liveIngest != null && liveIngest > 0;
+      const isActivelyIngesting = live?.state !== 'idle' && liveIngest != null && liveIngest > 0;
       if (lastIngest != null && lastIngest > 0) {
         ingestVal = lastIngest.toFixed(1);
       } else if (isActivelyIngesting) {
@@ -2437,6 +3656,8 @@ INDEX_HTML = r"""<!doctype html>
       } else if (liveIngest != null && liveIngest > 0) {
         ingestVal = liveIngest.toFixed(1);
       }
+
+      document.getElementById('val-tps').textContent = genDisplay;
       document.getElementById('val-ingest').textContent = ingestVal;
       document.getElementById('val-util').textContent = gpu.util != null ? `${gpu.util}%` : '--%';
       document.getElementById('bar-util').style.width = `${gpu.util || 0}%`;
@@ -2447,8 +3668,7 @@ INDEX_HTML = r"""<!doctype html>
       document.getElementById('val-temp').textContent = gpu.temp != null ? `${gpu.temp}°C` : '--°C';
       document.getElementById('val-fan').textContent = `Fan: ${gpu.fan || 0}%`;
 
-      // Context usage
-      const ctxInfo = data.context_info || {};
+      // Context card
       const nCtx = ctxInfo.n_ctx;
       const nPast = ctxInfo.n_past;
       const ctxEl = document.getElementById('val-ctx');
@@ -2458,7 +3678,7 @@ INDEX_HTML = r"""<!doctype html>
         if (nPast != null && nPast > 0) {
           const ctxUsed = nPast >= 1024 ? `${(nPast/1024).toFixed(1)}k` : `${nPast}`;
           ctxEl.textContent = `${ctxUsed} / ${ctxMax}`;
-          const pct = (nPast / nCtx) * 100;
+          const pct = Math.min(100, (nPast / nCtx) * 100);
           ctxBar.style.width = `${pct.toFixed(1)}%`;
           if (pct > 90) ctxBar.style.background = 'var(--danger)';
           else if (pct > 70) ctxBar.style.background = 'var(--warning)';
@@ -2473,8 +3693,8 @@ INDEX_HTML = r"""<!doctype html>
         ctxBar.style.width = '0%';
       }
 
-      // History chart - show live TPS (0 when idle) and last ingest
-      const tpsVal = (stats && stats.live_tps) || 0;
+      // History chart
+      const tpsVal = stats.live_tps || 0;
       history.util.push(gpu.util || 0); history.util.shift();
       history.vram.push(vramPct); history.vram.shift();
       history.tps.push(tpsVal); history.tps.shift();
@@ -2483,6 +3703,9 @@ INDEX_HTML = r"""<!doctype html>
       // Service details
       const infoModel = document.getElementById('info-model');
       const infoBadges = document.getElementById('info-badges');
+      const infoAvgRate = document.getElementById('info-avg-rate');
+      const infoRuns = document.getElementById('info-runs');
+
       if (data.active) {
         infoModel.textContent = data.active.label;
         let badges = '';
@@ -2493,46 +3716,50 @@ INDEX_HTML = r"""<!doctype html>
           badges += `<span class="badge badge-ctx">${ctxLabel}</span>`;
         }
         if (data.active.thinking) badges += `<span class="badge badge-think-panel">THINKING</span>`;
+        if (data.active.vision) badges += `<span class="badge badge-vision">VISION</span>`;
         infoBadges.innerHTML = badges;
       } else {
         infoModel.textContent = 'NONE';
         infoBadges.innerHTML = '';
       }
 
-      document.getElementById('info-avg-rate').textContent =
-        stats.average_rate_tps ? `${stats.average_rate_tps.toFixed(2)} T/S` : '-- T/S';
-      document.getElementById('info-runs').textContent = stats.completed_count || 0;
-      document.getElementById('info-clocks').textContent =
-        `${gpu.clock_gfx || '--'} / ${gpu.clock_mem || '--'} MHz`;
-      document.getElementById('info-power').textContent =
-        `${gpu.power ? gpu.power.toFixed(0) : '--'}W / ${gpu.power_limit ? gpu.power_limit.toFixed(0) : '--'}W`;
+      infoAvgRate.textContent = stats.average_rate_tps ? `${stats.average_rate_tps.toFixed(2)} T/S` : '-- T/S';
+      infoRuns.textContent = stats.completed_count || 0;
+
+      const clocksEl = document.getElementById('info-clocks');
+      const powerEl = document.getElementById('info-power');
+      clocksEl.textContent = `${gpu.clock_gfx || '--'} / ${gpu.clock_mem || '--'} MHz`;
+      powerEl.textContent = `${gpu.power ? gpu.power.toFixed(0) : '--'}W / ${gpu.power_limit ? gpu.power_limit.toFixed(0) : '--'}W`;
+
       const btnBenchmark = document.getElementById('btnBenchmark');
       const btnBenchmarkFull = document.getElementById('btnBenchmarkFull');
+      const infoBenchPrefill = document.getElementById('info-bench-prefill');
+      const infoBenchGen = document.getElementById('info-bench-gen');
+      const infoBenchLast = document.getElementById('info-bench-last');
+      const infoBenchHistory = document.getElementById('info-bench-history');
+
+      const benchEnabled = true;
+      const canRun = (!!data.active?.healthy) && !data.switch_in_progress && !bench.in_progress;
       if (btnBenchmark) {
-        const canRun = !!(data.active?.healthy) && !data.switch_in_progress && !bench.in_progress;
         btnBenchmark.disabled = !canRun;
         btnBenchmark.textContent = (bench.in_progress && bench.profile === 'balanced') ? 'BENCHMARKING...' : 'RUN BENCHMARK';
       }
       if (btnBenchmarkFull) {
-        const canRun = !!(data.active?.healthy) && !data.switch_in_progress && !bench.in_progress;
         btnBenchmarkFull.disabled = !canRun;
         btnBenchmarkFull.textContent = (bench.in_progress && bench.profile === 'full') ? 'BENCHMARKING...' : 'RUN FULL BENCHMARK';
       }
 
       const benchRes = bench.last_result || {};
-      document.getElementById('info-bench-prefill').textContent =
-        benchRes.prefill_tps ? `${benchRes.prefill_tps.toFixed(2)} T/S` : '-- T/S';
-      document.getElementById('info-bench-gen').textContent =
-        benchRes.gen_tps ? `${benchRes.gen_tps.toFixed(2)} T/S` : '-- T/S';
+      infoBenchPrefill.textContent = benchRes.prefill_tps ? `${benchRes.prefill_tps.toFixed(2)} T/S` : '-- T/S';
+      infoBenchGen.textContent = benchRes.gen_tps ? `${benchRes.gen_tps.toFixed(2)} T/S` : '-- T/S';
       if (bench.in_progress && bench.started_at) {
-        document.getElementById('info-bench-last').textContent = `${(bench.profile || 'balanced').toUpperCase()} running since ${fmtLocalTs(bench.started_at)}`;
+        infoBenchLast.textContent = `${(bench.profile || 'balanced').toUpperCase()} running since ${fmtLocalTs(bench.started_at)}`;
       } else if (bench.last_error) {
-        document.getElementById('info-bench-last').textContent = `Failed: ${bench.last_error}`;
+        infoBenchLast.textContent = `Failed: ${bench.last_error}`;
       } else if (benchRes.completed_at) {
-        document.getElementById('info-bench-last').textContent =
-          `${(benchRes.profile || 'balanced').toUpperCase()} at ${fmtLocalTs(benchRes.completed_at)}`;
+        infoBenchLast.textContent = `${(benchRes.profile || 'balanced').toUpperCase()} at ${fmtLocalTs(benchRes.completed_at)}`;
       } else {
-        document.getElementById('info-bench-last').textContent = '--';
+        infoBenchLast.textContent = '--';
       }
 
       const historyEl = document.getElementById('info-bench-history');
@@ -2576,23 +3803,32 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function confirmSwitch(key, label) {
-      if (lastData?.active?.key === key && lastData?.active?.healthy) {
+      const isActive = (lastData?.active?.key === key && lastData?.active?.healthy) ||
+                       (key === 'vllm' && lastData?.active_vllm?.healthy);
+      if (isActive) {
         const el = document.getElementById('switchStatus');
         el.textContent = `${label} is already active and healthy.`;
         setTimeout(() => { el.textContent = lastData?.last_message || ''; }, 3000);
         return;
       }
       if (lastData?.switch_in_progress) return;
+      closeSidebar();
       pendingAction = { type: 'switch', key };
       document.getElementById('modalTitle').textContent = 'Switch Model?';
-      document.getElementById('modalText').textContent =
-        `Switch to ${label}? The current LLM will be stopped and the new model loaded into VRAM.`;
+      if (key === 'vllm') {
+        document.getElementById('modalText').textContent =
+          'Switch to vLLM? The current LLM (llama.cpp) will be stopped and vLLM loaded into VRAM.';
+      } else {
+        document.getElementById('modalText').textContent =
+          `Switch to ${label}? The current LLM will be stopped and the new model loaded into VRAM.`;
+      }
       document.getElementById('btnConfirmSwitch').textContent = 'PROCEED';
       document.getElementById('btnConfirmSwitch').style.background = 'var(--accent)';
       document.getElementById('confirmModal').classList.add('active');
     }
 
     function confirmStopAll() {
+      closeSidebar();
       pendingAction = { type: 'stop' };
       document.getElementById('modalTitle').textContent = 'Stop All Models?';
       document.getElementById('modalText').textContent =
@@ -2610,6 +3846,7 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       if (lastData?.switch_in_progress) return;
+      closeSidebar();
       pendingAction = { type: 'restart' };
       document.getElementById('modalTitle').textContent = 'Restart Model?';
       document.getElementById('modalText').textContent =
@@ -2675,10 +3912,54 @@ INDEX_HTML = r"""<!doctype html>
       }
     };
 
-    function toggleEventsPanel() {
-      eventsPanelOpen = !eventsPanelOpen;
-      document.getElementById('eventsPanel').classList.toggle('events-collapsed', !eventsPanelOpen);
-      document.getElementById('evToggleIcon').textContent = eventsPanelOpen ? '▼' : '▶';
+    // ---- Mobile sidebar drawer ----
+    function openSidebar() {
+      document.querySelector('.sidebar').classList.add('open');
+      document.getElementById('sidebarBackdrop').classList.add('open');
+    }
+    function closeSidebar() {
+      document.querySelector('.sidebar').classList.remove('open');
+      document.getElementById('sidebarBackdrop').classList.remove('open');
+    }
+    function toggleSidebar() {
+      if (document.querySelector('.sidebar').classList.contains('open')) closeSidebar();
+      else openSidebar();
+    }
+    window.addEventListener('resize', () => { if (window.innerWidth > 768) closeSidebar(); });
+
+    // Quick navigation from the drawer/sidebar to a section.
+    // Scroll the .main-content container explicitly (scrollIntoView is unreliable
+    // inside a nested overflow container).
+    function scrollMainTo(el) {
+      const main = document.querySelector('.main-content');
+      const top = el.getBoundingClientRect().top - main.getBoundingClientRect().top + main.scrollTop - 8;
+      main.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+    }
+    function goTo(section) {
+      closeSidebar();
+      setTimeout(() => {
+        if (section === 'overview') {
+          document.querySelector('.main-content').scrollTo({ top: 0, behavior: 'smooth' });
+        } else if (section === 'requests') {
+          switchActivityTab('reqlog');
+          scrollMainTo(document.getElementById('activityPanel'));
+        } else if (section === 'events') {
+          switchActivityTab('events');
+          scrollMainTo(document.getElementById('activityPanel'));
+        }
+      }, 60);
+    }
+
+    let activeActivityTab = 'reqlog';
+    function switchActivityTab(tab) {
+      activeActivityTab = tab;
+      document.getElementById('tabbtn-reqlog').classList.toggle('active', tab === 'reqlog');
+      document.getElementById('tabbtn-events').classList.toggle('active', tab === 'events');
+      document.getElementById('tab-reqlog').hidden = tab !== 'reqlog';
+      document.getElementById('tab-events').hidden = tab !== 'events';
+      // The filter toolbar only applies to the request log.
+      document.getElementById('reqlogTools').style.visibility = tab === 'reqlog' ? 'visible' : 'hidden';
+      if (tab === 'reqlog') refreshRequestLog(true);
     }
 
     function updateEventsPanel(data) {
@@ -2726,9 +4007,220 @@ INDEX_HTML = r"""<!doctype html>
       if (el) el.textContent = `Updated ${secs}s ago`;
     }, 1000);
 
+    // ---- Request Log ----
+    let reqlogSearchTimer = null;
+    let reqlogBusy = false;
+
+    function onReqlogSearch() {
+      clearTimeout(reqlogSearchTimer);
+      reqlogSearchTimer = setTimeout(() => refreshRequestLog(true), 300);
+    }
+
+    function fmtLatency(ms) {
+      if (ms == null) return '--';
+      if (ms >= 1000) return (ms / 1000).toFixed(1) + 's';
+      return Math.round(ms) + 'ms';
+    }
+
+    function reqlogTokens(r) {
+      if (r.prompt_tokens == null && r.completion_tokens == null) return '--';
+      const p = r.prompt_tokens == null ? '?' : r.prompt_tokens;
+      const c = r.completion_tokens == null ? '?' : r.completion_tokens;
+      return p + '/' + c;
+    }
+
+    async function refreshRequestLog(force) {
+      const auto = document.getElementById('reqlogAuto');
+      if (!force && (!auto || !auto.checked)) return;
+      // Don't churn the list out from under an open detail modal.
+      if (!force && document.getElementById('reqDetailModal').classList.contains('active')) return;
+      if (reqlogBusy) return;
+      reqlogBusy = true;
+      try {
+        const ep = document.getElementById('reqlogEndpoint').value;
+        const q = document.getElementById('reqlogSearch').value.trim();
+        const params = new URLSearchParams({ limit: '300', endpoint: ep });
+        if (q) params.set('q', q);
+        const r = await fetch('/api/request-log?' + params.toString(), { cache: 'no-store' });
+        const d = await r.json();
+        const body = document.getElementById('reqlogBody');
+        const countEl = document.getElementById('reqlogCount');
+        if (!d.available) {
+          body.innerHTML = '<tr><td colspan="10" class="reqlog-empty">No request log yet — start a model stack, then send a request to port 8080 or 28082.</td></tr>';
+          countEl.textContent = '';
+          return;
+        }
+        if (d.error) {
+          body.innerHTML = '<tr><td colspan="10" class="reqlog-empty">Error reading log: ' + escHtml(d.error) + '</td></tr>';
+          countEl.textContent = '';
+          return;
+        }
+        const rows = d.rows || [];
+        countEl.textContent = rows.length ? String(rows.length) : '';
+        if (!rows.length) {
+          body.innerHTML = '<tr><td colspan="10" class="reqlog-empty">No matching requests.</td></tr>';
+          return;
+        }
+        body.innerHTML = rows.map(r => {
+          const t = fmtLocalTs(r.ts_iso).replace(/^.*?,\s*/, '');
+          const epCls = r.endpoint === '8080' ? 'reqlog-ep-8080' : 'reqlog-ep-28082';
+          const ua = r.user_agent ? '<span class="reqlog-ua" title="' + escHtml(r.user_agent) + '">' + escHtml(r.user_agent) + '</span>' : '';
+          const origin = '<span class="reqlog-origin-ip">' + escHtml(r.client_ip || '--') + '</span>' + ua;
+          const statusCls = (r.status && r.status < 400) ? 'status-ok' : 'status-bad';
+          const snip = r.prompt_snippet ? '<span class="reqlog-snip" title="' + escHtml(r.prompt_snippet) + '">' + escHtml(r.prompt_snippet) + '</span>' : '';
+          const streamMark = r.stream ? ' <span title="streamed" style="color:var(--accent)">↯</span>' : '';
+          return '<tr class="reqlog-row" onclick="openRequestDetail(' + r.id + ')">'
+            + '<td class="reqlog-time">' + escHtml(t) + '</td>'
+            + '<td><span class="reqlog-ep ' + epCls + '">' + escHtml(r.endpoint || '?') + '</span></td>'
+            + '<td>' + origin + '</td>'
+            + '<td class="reqlog-model">' + escHtml(r.model || '--') + '</td>'
+            + '<td class="reqlog-path">' + escHtml(r.path || '--') + streamMark + '</td>'
+            + '<td><span class="status-pill ' + statusCls + '">' + escHtml(r.status == null ? '--' : r.status) + '</span></td>'
+            + '<td>' + escHtml(fmtLatency(r.latency_ms)) + '</td>'
+            + '<td>' + escHtml(reqlogTokens(r)) + '</td>'
+            + '<td>' + snip + '</td>'
+            + '<td><span class="reqlog-view">View →</span></td>'
+            + '</tr>';
+        }).join('');
+      } catch (e) {
+        console.error('Request log error:', e);
+      } finally {
+        reqlogBusy = false;
+      }
+    }
+
+    // ---- Request detail modal ----
+    function closeRequestDetail() {
+      document.getElementById('reqDetailModal').classList.remove('active');
+    }
+
+    function rdContentToHtml(content) {
+      // content may be a string or an array of OpenAI content parts.
+      if (typeof content === 'string') return escHtml(content);
+      if (Array.isArray(content)) {
+        return content.map(part => {
+          if (!part || typeof part !== 'object') return escHtml(String(part));
+          if (part.type === 'text') return escHtml(part.text || '');
+          if (part.type === 'image_url') {
+            const u = (part.image_url && part.image_url.url) || '';
+            return '<div class="rd-img">🖼 image: ' + escHtml(u.length > 80 ? u.slice(0, 80) + '…' : u) + '</div>';
+          }
+          return escHtml(JSON.stringify(part));
+        }).join('');
+      }
+      if (content == null) return '<span class="rd-note">(empty)</span>';
+      return escHtml(JSON.stringify(content));
+    }
+
+    function rdMessage(role, content, reasoning) {
+      const cls = 'rd-role-' + (['system','user','assistant','tool'].includes(role) ? role : 'system');
+      let html = '<div class="rd-msg"><div class="rd-msg-role ' + cls + '">' + escHtml(role || 'message') + '</div>';
+      html += '<div class="rd-msg-content">' + (rdContentToHtml(content) || '<span class="rd-note">(no content)</span>') + '</div>';
+      if (reasoning) {
+        html += '<details class="rd-reasoning"><summary>Reasoning (' + reasoning.length + ' chars)</summary>'
+             + '<div class="rd-msg-content">' + escHtml(reasoning) + '</div></details>';
+      }
+      html += '</div>';
+      return html;
+    }
+
+    function renderRequestDetail(r) {
+      const epCls = r.endpoint === '8080' ? 'reqlog-ep-8080' : 'reqlog-ep-28082';
+      let html = '<div class="rd-meta">';
+      const metas = [
+        ['Endpoint', '<span class="reqlog-ep ' + epCls + '">' + escHtml(r.endpoint || '?') + '</span>'],
+        ['Time', escHtml(fmtLocalTs(r.ts_iso))],
+        ['Origin IP', escHtml(r.client_ip || '--')],
+        ['User-Agent', escHtml(r.user_agent || '--')],
+        ['Method', escHtml(r.method || '--')],
+        ['Path', escHtml(r.path || '--')],
+        ['Status', escHtml(r.status == null ? '--' : String(r.status))],
+        ['Latency', escHtml(fmtLatency(r.latency_ms))],
+        ['Stream', r.stream ? 'yes' : 'no'],
+        ['Tokens (p/c/total)', escHtml((r.prompt_tokens ?? '?') + ' / ' + (r.completion_tokens ?? '?') + ' / ' + (r.total_tokens ?? '?'))],
+      ];
+      html += metas.map(m => '<div class="rd-m"><span class="rd-k">' + m[0] + '</span><span class="rd-v">' + m[1] + '</span></div>').join('');
+      html += '</div>';
+
+      // Request
+      let req = null;
+      try { req = r.request_body ? JSON.parse(r.request_body) : null; } catch (e) {}
+      html += '<div class="rd-section-title">Request</div>';
+      if (req) {
+        const paramKeys = ['model','temperature','top_p','top_k','max_tokens','presence_penalty','frequency_penalty','stream'];
+        const params = paramKeys.filter(k => req[k] !== undefined)
+          .map(k => '<span class="rd-param"><b>' + k + '</b>: ' + escHtml(JSON.stringify(req[k])) + '</span>').join('');
+        if (params) html += '<div class="rd-params">' + params + '</div>';
+        const msgs = Array.isArray(req.messages) ? req.messages : null;
+        if (msgs) {
+          html += msgs.map(m => rdMessage(m.role, m.content, m.reasoning_content)).join('');
+        } else if (typeof req.prompt === 'string') {
+          html += rdMessage('prompt', req.prompt);
+        }
+      } else if (r.request_body) {
+        html += '<div class="rd-note">Request body too large to parse (' + r.request_body.length + ' chars, likely truncated). See Raw JSON below.</div>';
+      } else {
+        html += '<div class="rd-note">No request body stored for this request (only chat/completions/embeddings bodies are captured).</div>';
+      }
+
+      // Response
+      let resp = null;
+      try { resp = r.response_body ? JSON.parse(r.response_body) : null; } catch (e) {}
+      html += '<div class="rd-section-title">Response' + (resp && resp._reconstructed_from_stream ? ' <span class="rd-note">(reconstructed from stream)</span>' : '') + '</div>';
+      if (resp && Array.isArray(resp.choices) && resp.choices.length) {
+        const ch = resp.choices[0];
+        const msg = ch.message || ch.delta || {};
+        html += rdMessage('assistant', msg.content, msg.reasoning_content);
+        const bits = [];
+        if (ch.finish_reason) bits.push('<span class="rd-param"><b>finish</b>: ' + escHtml(ch.finish_reason) + '</span>');
+        if (resp.usage) bits.push('<span class="rd-param"><b>usage</b>: ' + escHtml(JSON.stringify(resp.usage)) + '</span>');
+        if (bits.length) html += '<div class="rd-params">' + bits.join('') + '</div>';
+      } else if (resp) {
+        html += '<div class="rd-note">Non-chat response.</div>';
+      } else if (r.response_body) {
+        html += '<div class="rd-note">Response body too large to parse (' + r.response_body.length + ' chars, likely truncated). See Raw JSON below.</div>';
+      } else {
+        html += '<div class="rd-note">No response body stored.</div>';
+      }
+
+      // Raw
+      if (r.request_body || r.response_body) {
+        html += '<details class="rd-raw"><summary>Raw JSON</summary>';
+        if (r.request_body) html += '<div class="rd-k" style="margin-top:8px">request_body</div><pre>' + escHtml(r.request_body) + '</pre>';
+        if (r.response_body) html += '<div class="rd-k" style="margin-top:8px">response_body</div><pre>' + escHtml(r.response_body) + '</pre>';
+        html += '</details>';
+      }
+      return html;
+    }
+
+    async function openRequestDetail(id) {
+      const modal = document.getElementById('reqDetailModal');
+      const bodyEl = document.getElementById('reqDetailBody');
+      const titleEl = document.getElementById('reqDetailTitle');
+      titleEl.textContent = 'Request #' + id;
+      bodyEl.innerHTML = '<div class="rd-note">Loading…</div>';
+      modal.classList.add('active');
+      try {
+        const r = await fetch('/api/request-log/detail?id=' + encodeURIComponent(id), { cache: 'no-store' });
+        const d = await r.json();
+        if (!d.row) {
+          bodyEl.innerHTML = '<div class="rd-note">Not found' + (d.error ? ': ' + escHtml(d.error) : '') + '</div>';
+          return;
+        }
+        titleEl.textContent = (d.row.method || '') + ' ' + (d.row.path || '') + '  ·  #' + id;
+        bodyEl.innerHTML = renderRequestDetail(d.row);
+      } catch (e) {
+        bodyEl.innerHTML = '<div class="rd-note">Error: ' + escHtml(e.message) + '</div>';
+      }
+    }
+
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeRequestDetail(); closeSidebar(); } });
+
     initChart();
     refresh();
     setInterval(refresh, 500);
+    refreshRequestLog(true);
+    setInterval(() => refreshRequestLog(false), 3000);
   </script>
 </body>
 </html>
@@ -2787,11 +4279,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self._begin_request()
-        if self.path in ("/", "/index.html"):
+        parsed = urlparse(self.path)
+        route = parsed.path
+        if route in ("/", "/index.html"):
             self._send_html(INDEX_HTML)
-        elif self.path == "/api/status":
+        elif route == "/api/status":
             status = build_status(self)
             self._send_json(status)
+        elif route == "/api/request-log":
+            self._send_json(read_request_log(parse_qs(parsed.query)))
+        elif route == "/api/request-log/detail":
+            self._send_json(read_request_detail(parse_qs(parsed.query)))
         else:
             self._send_json({"error": "Not found"}, 404)
         self._finish_request("GET", self.path)

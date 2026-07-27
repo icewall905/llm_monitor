@@ -12,6 +12,10 @@ services:
       - STACKS_DIR=${STACKS_DIR:-/mnt/nvmestorage/compose/llama.cpp/stacks}
       - MODELS_DIR=${MODELS_DIR:-/mnt/nvmestorage/compose/llama.cpp/models}
       - LLAMA_WORKING_DIR_LABEL=${LLAMA_WORKING_DIR_LABEL:-/mnt/nvmestorage/compose/llama.cpp}
+      - REQUEST_LOG_DB=${REQUEST_LOG_DB:-/request-logs/requests.db}
+      - VLLM_DIR=${VLLM_DIR:-/mnt/nvmestorage/compose/vllm}
+      - VLLM_SERVER_SERVICE=${VLLM_SERVER_SERVICE:-vllm-server}
+      - BEELLAMA_DIR=${BEELLAMA_DIR:-/mnt/nvmestorage/compose/beellama.cpp}
     stdin_open: true
     tty: true
     ports:
@@ -20,6 +24,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/nvmestorage/compose/llama.cpp:/mnt/nvmestorage/compose/llama.cpp:ro
+      # Request log DB (read-write so the SQLite WAL reader can open -wal/-shm sidecars)
+      - /mnt/nvmestorage/compose/llama.cpp/request-logs:/request-logs:rw
+      - /mnt/nvmestorage/compose/vllm:/mnt/nvmestorage/compose/vllm:ro
+      - /mnt/nvmestorage/compose/beellama.cpp:/mnt/nvmestorage/compose/beellama.cpp:ro
       - ./config.yaml:/gpu-monitor/config.yaml:ro
       - ./config.local.yaml:/gpu-monitor/config.local.yaml:ro
       - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro

@@ -261,6 +261,17 @@ FULL_BENCHMARK_MAX_HISTORY = int(os.environ.get("BENCHMARK_HISTORY_LIMIT", "10")
 BENCHMARK_STALE_SEC = int(
     os.environ.get("BENCHMARK_STALE_SEC", str(max(BENCHMARK_TIMEOUT_SEC * 4, 600)))
 )
+FULL_BENCHMARK_SPECS = [
+    {"name": "prefill_xl", "prompt_tokens": 4096, "n_predict": 32},
+    {"name": "prefill_heavy", "prompt_tokens": 2048, "n_predict": 64},
+    {"name": "prefill_medium", "prompt_tokens": 1024, "n_predict": 128},
+    {"name": "mixed", "prompt_tokens": 1024, "n_predict": 256},
+    {"name": "mixed_even", "prompt_tokens": 512, "n_predict": 512},
+    {"name": "gen_heavy", "prompt_tokens": 256, "n_predict": 1024},
+    {"name": "gen_xl", "prompt_tokens": 128, "n_predict": 2048},
+]
+FULL_BENCHMARK_REPEATS = 2
+FULL_BENCHMARK_RUNS = len(FULL_BENCHMARK_SPECS) * FULL_BENCHMARK_REPEATS
 LOG_MAX_EVENTS = int(os.environ.get("LOG_MAX_EVENTS", "100"))
 LOG_WATCHER_INTERVAL_SEC = float(os.environ.get("LOG_WATCHER_INTERVAL_SEC", "2.0"))
 HEARTBEAT_INTERVAL_SEC = float(os.environ.get("HEARTBEAT_INTERVAL_SEC", "30.0"))
@@ -2023,27 +2034,25 @@ def run_benchmark_profile(
         return result, None
 
     if profile == "full":
-        specs = [
-            {"name": "prefill_heavy", "prompt_tokens": 2048, "n_predict": 64},
-            {"name": "mixed", "prompt_tokens": 1024, "n_predict": 256},
-            {"name": "gen_heavy", "prompt_tokens": 256, "n_predict": 512},
-        ]
+        specs = FULL_BENCHMARK_SPECS
+        repeats = FULL_BENCHMARK_REPEATS
         runs = []
         for idx, spec in enumerate(specs, start=1):
-            if callable(progress_cb):
-                progress_cb(f"full benchmark: pass {idx}/{len(specs)} ({spec['name']})...")
-            run, error = run_single_benchmark(
-                active_key,
-                containers,
-                prompt_tokens=spec["prompt_tokens"],
-                n_predict=spec["n_predict"],
-            )
-            if error:
-                return None, f"Full benchmark failed on {spec['name']}: {error}"
-            run["name"] = spec["name"]
-            run["requested_prompt_tokens"] = spec["prompt_tokens"]
-            run["requested_n_predict"] = spec["n_predict"]
-            runs.append(run)
+            for rep in range(repeats):
+                if callable(progress_cb):
+                    progress_cb(f"full benchmark: pass {idx}/{len(specs)} ({spec['name']}, run {rep + 1}/{repeats})...")
+                run, error = run_single_benchmark(
+                    active_key,
+                    containers,
+                    prompt_tokens=spec["prompt_tokens"],
+                    n_predict=spec["n_predict"],
+                )
+                if error:
+                    return None, f"Full benchmark failed on {spec['name']} (run {rep + 1}/{repeats}): {error}"
+                run["name"] = f"{spec['name']}#{rep + 1}"
+                run["requested_prompt_tokens"] = spec["prompt_tokens"]
+                run["requested_n_predict"] = spec["n_predict"]
+                runs.append(run)
 
         prefill_avg = sum(float(r["prefill_tps"]) for r in runs) / len(runs)
         gen_avg = sum(float(r["gen_tps"]) for r in runs) / len(runs)
@@ -2628,7 +2637,11 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
             started_dt = parse_iso_utc(BENCHMARK_STATE.get("started_at"))
             if started_dt is not None:
                 age = (datetime.now(timezone.utc) - started_dt).total_seconds()
-                if age > BENCHMARK_STALE_SEC:
+                stale_sec = BENCHMARK_STALE_SEC
+                if BENCHMARK_STATE.get("profile") == "full":
+                    # 14 sequential runs can legitimately take much longer
+                    stale_sec = max(stale_sec, FULL_BENCHMARK_RUNS * BENCHMARK_TIMEOUT_SEC + 60)
+                if age > stale_sec:
                     BENCHMARK_STATE["in_progress"] = False
                     BENCHMARK_STATE["completed_at"] = now_iso()
                     BENCHMARK_STATE["last_error"] = (
@@ -3478,10 +3491,14 @@ INDEX_HTML = r"""<!doctype html>
     const history = { util: Array(60).fill(0), vram: Array(60).fill(0), tps: Array(60).fill(0) };
 
     // Family display order for sidebar grouping
-    const FAMILY_ORDER = ['vllm','gemma','gptoss','glm','mistral','nemotron','qwen','other'];
+    // NOTE: a model whose LLM_META family="..." is missing from FAMILY_ORDER is silently
+    // dropped from the sidebar — the render loop below iterates this list, not the API
+    // response. Adding a stack with a new family value REQUIRES adding it here too.
+    const FAMILY_ORDER = ['vllm','muse-glimmer','gemma','gptoss','glm','mistral','nemotron','qwen','deepseek','other'];
     const FAMILY_LABELS = {
       vllm: 'vLLM', qwen: 'QWEN', nemotron: 'NEMOTRON', gptoss: 'GPT-OSS',
-      glm: 'GLM', mistral: 'MISTRAL', gemma: 'GEMMA', other: 'OTHER'
+      glm: 'GLM', mistral: 'MISTRAL', gemma: 'GEMMA', deepseek: 'DEEPSEEK',
+      'muse-glimmer': 'MUSE GLIMMER', other: 'OTHER'
     };
     // Persisted collapse state: key = family, value = true if collapsed
     let FAMILY_COLLAPSED = {};
@@ -3547,7 +3564,12 @@ INDEX_HTML = r"""<!doctype html>
       const switching = data.switch_in_progress;
       const switchTarget = data.last_requested_model;
       let html = '';
-      for (const fam of FAMILY_ORDER) {
+      // Any family present in the data but absent from FAMILY_ORDER is appended here,
+      // so a new LLM_META family="..." can never silently vanish from the sidebar.
+      const renderOrder = FAMILY_ORDER.concat(
+        Object.keys(groups).filter(f => !FAMILY_ORDER.includes(f)).sort()
+      );
+      for (const fam of renderOrder) {
         if (!groups[fam]) continue;
         const collapsed = FAMILY_COLLAPSED[fam];
         const chevron = collapsed ? '&#9658;' : '&#9660;';

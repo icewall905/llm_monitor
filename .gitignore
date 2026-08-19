@@ -11,6 +11,10 @@ __pycache__/
 .env
 config.yaml
 config.local.yaml
+*.db
+*.db-wal
+*.db-shm
+request-logs/
 .claude/
 .playwright-mcp/
 dashboard-check.png

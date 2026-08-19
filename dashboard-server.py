@@ -2,6 +2,7 @@
 import ast
 import json
 import os
+import random
 import re
 import select
 import shlex
@@ -206,15 +207,51 @@ def load_runtime_config() -> dict:
 
 
 RUNTIME_CONFIG = load_runtime_config()
+
+# ── User settings ────────────────────────────────────────────────────────────
+# docker-compose.yml sets LLAMA_DIR/STACKS_DIR/VLLM_DIR/... as environment variables,
+# and config.yaml documents env as always winning. A settings UI that lost to env on
+# this deployment would silently do nothing, so values saved from the dashboard are
+# kept in their own file and given the highest precedence. The UI shows which source
+# each effective value came from, so the override is never invisible.
+SETTINGS_PATH = Path(os.environ.get("DASHBOARD_SETTINGS", "/request-logs/settings.json"))
+SETTINGS_LOCK = threading.Lock()
+USER_SETTINGS: dict = {}
+
+
+def load_user_settings() -> dict:
+    try:
+        if SETTINGS_PATH.is_file():
+            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {k: v for k, v in data.items() if isinstance(v, str) and v.strip()}
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+USER_SETTINGS = load_user_settings()
+
+
+def resolve_setting(key: str, env_name: str, default: str) -> tuple[str, str]:
+    """Effective value for a path setting plus where it came from."""
+    if USER_SETTINGS.get(key):
+        return USER_SETTINGS[key], "settings"
+    if os.environ.get(env_name):
+        return os.environ[env_name], "env"
+    if RUNTIME_CONFIG.get(key):
+        return str(RUNTIME_CONFIG[key]), "config"
+    return default, "default"
+
+
+_llama_dir_val, _ = resolve_setting("llama_dir", "LLAMA_DIR", "/opt/llama.cpp")
 DEFAULT_LLAMA_DIR = str(RUNTIME_CONFIG.get("llama_dir") or "/opt/llama.cpp")
-LLAMA_DIR = Path(os.environ.get("LLAMA_DIR", DEFAULT_LLAMA_DIR))
+LLAMA_DIR = Path(_llama_dir_val)
 
 DEFAULT_STACKS_DIR = str(RUNTIME_CONFIG.get("stacks_dir") or (LLAMA_DIR / "stacks"))
-STACKS_DIR = Path(os.environ.get("STACKS_DIR", DEFAULT_STACKS_DIR))
+STACKS_DIR = Path(resolve_setting("stacks_dir", "STACKS_DIR", str(LLAMA_DIR / "stacks"))[0])
 
-MODELS_DIR = Path(
-    os.environ.get("MODELS_DIR", str(RUNTIME_CONFIG.get("models_dir") or (LLAMA_DIR / "models")))
-)
+MODELS_DIR = Path(resolve_setting("models_dir", "MODELS_DIR", str(LLAMA_DIR / "models"))[0])
 
 DEFAULT_SWITCH_SCRIPT = str(RUNTIME_CONFIG.get("switch_script") or (LLAMA_DIR / "switch-llm.sh"))
 SWITCH_SCRIPT = Path(os.environ.get("SWITCH_SCRIPT", DEFAULT_SWITCH_SCRIPT))
@@ -226,7 +263,7 @@ LLAMA_WORKING_DIR_LABEL = os.environ.get(
 
 # ── vLLM config ──────────────────────────────────────────────────────────────
 DEFAULT_VLLM_DIR = str(RUNTIME_CONFIG.get("vllm_dir") or "/opt/vllm")
-VLLM_DIR = Path(os.environ.get("VLLM_DIR", DEFAULT_VLLM_DIR))
+VLLM_DIR = Path(resolve_setting("vllm_dir", "VLLM_DIR", "/opt/vllm")[0])
 VLLM_SERVER_SERVICE = os.environ.get(
     "VLLM_SERVER_SERVICE",
     str(RUNTIME_CONFIG.get("vllm_server_service") or "vllm-server"),
@@ -237,15 +274,14 @@ VLLM_WORKING_DIR_LABEL = os.environ.get(
 )
 # ── BeeLlama config ──────────────────────────────────────────────────────────
 DEFAULT_BEELLAMA_DIR = str(RUNTIME_CONFIG.get("beellama_dir") or "/opt/beellama.cpp")
-BEELLAMA_DIR = Path(os.environ.get("BEELLAMA_DIR", DEFAULT_BEELLAMA_DIR))
+BEELLAMA_DIR = Path(resolve_setting("beellama_dir", "BEELLAMA_DIR", "/opt/beellama.cpp")[0])
 BEELLAMA_WORKING_DIR_LABEL = os.environ.get(
     "BEELLAMA_WORKING_DIR_LABEL",
     str(RUNTIME_CONFIG.get("beellama_working_dir_label") or str(BEELLAMA_DIR)),
 )
-BEELLAMA_STACKS_DIR = Path(os.environ.get(
-    "BEELLAMA_STACKS_DIR",
-    str(RUNTIME_CONFIG.get("beellama_stacks_dir") or str(BEELLAMA_DIR / "stacks")),
-))
+BEELLAMA_STACKS_DIR = Path(resolve_setting(
+    "beellama_stacks_dir", "BEELLAMA_STACKS_DIR", str(BEELLAMA_DIR / "stacks")
+)[0])
 
 SWITCH_READY_TIMEOUT_SEC = int(os.environ.get("SWITCH_READY_TIMEOUT_SEC", "900"))
 SWITCH_POLL_SEC = float(os.environ.get("SWITCH_POLL_SEC", "5"))
@@ -272,6 +308,34 @@ FULL_BENCHMARK_SPECS = [
 ]
 FULL_BENCHMARK_REPEATS = 2
 FULL_BENCHMARK_RUNS = len(FULL_BENCHMARK_SPECS) * FULL_BENCHMARK_REPEATS
+# ── Metrics history ──────────────────────────────────────────────────────────
+# The dashboard's in-page buffers only ever held 60 samples and died on reload, so
+# anything past a couple of minutes has to be persisted server-side. SQLite on the
+# same rw volume the request log already uses, so it survives container rebuilds.
+METRICS_DB = os.environ.get("METRICS_DB", "/request-logs/metrics.db")
+METRICS_SAMPLE_SEC = float(os.environ.get("METRICS_SAMPLE_SEC", "5"))
+METRICS_RETENTION_DAYS = float(os.environ.get("METRICS_RETENTION_DAYS", "31"))
+# Points returned per query. Buckets are sized to hit this, so a 30-day range costs
+# the same over the wire as a 5-minute one.
+METRICS_MAX_POINTS = int(os.environ.get("METRICS_MAX_POINTS", "240"))
+METRICS_PRUNE_EVERY_SEC = 3600.0
+METRICS_RANGES = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "1h": 3600,
+    "24h": 86400,
+    "7d": 604800,
+    "30d": 2592000,
+}
+# A throughput reading older than this is stale — record NULL rather than a flat line
+# that implies the model was idle when really nothing was sampling it.
+METRICS_LIVE_MAX_AGE_SEC = 20.0
+METRICS_LIVE_LOCK = threading.Lock()
+METRICS_LIVE = {"ts": 0.0, "tps": None, "ingest": None}
+METRICS_DB_LOCK = threading.Lock()
+METRICS_DB_READY = False
+
 LOG_MAX_EVENTS = int(os.environ.get("LOG_MAX_EVENTS", "100"))
 LOG_WATCHER_INTERVAL_SEC = float(os.environ.get("LOG_WATCHER_INTERVAL_SEC", "2.0"))
 HEARTBEAT_INTERVAL_SEC = float(os.environ.get("HEARTBEAT_INTERVAL_SEC", "30.0"))
@@ -298,6 +362,164 @@ def parse_llm_meta(path: Path) -> dict:
             if m:
                 meta[m.group(1)] = m.group(2)
     return meta
+
+
+SETTING_DEFS = [
+    {
+        "key": "stacks_dir",
+        "env": "STACKS_DIR",
+        "label": "llama.cpp stacks folder",
+        "help": "Scanned for *.yml containing '# LLM_META display_name=' headers.",
+        "scans": True,
+    },
+    {
+        "key": "vllm_dir",
+        "env": "VLLM_DIR",
+        "label": "vLLM stacks folder",
+        "help": "Scanned for vLLM compose files. Leave as-is if you do not run vLLM.",
+        "scans": True,
+    },
+    {
+        "key": "beellama_stacks_dir",
+        "env": "BEELLAMA_STACKS_DIR",
+        "label": "BeeLlama stacks folder",
+        "help": "Scanned for BeeLlama compose files.",
+        "scans": True,
+    },
+    {
+        "key": "llama_dir",
+        "env": "LLAMA_DIR",
+        "label": "llama.cpp root",
+        "help": "Working directory for switch-llm.sh. Stack paths are resolved relative to it.",
+        "scans": False,
+    },
+    {
+        "key": "models_dir",
+        "env": "MODELS_DIR",
+        "label": "Models folder",
+        "help": "Where the GGUF files live. Informational only.",
+        "scans": False,
+    },
+    {
+        "key": "beellama_dir",
+        "env": "BEELLAMA_DIR",
+        "label": "BeeLlama root",
+        "help": "BeeLlama compose project root.",
+        "scans": False,
+    },
+]
+_SETTING_KEYS = {d["key"] for d in SETTING_DEFS}
+
+
+def _current_setting_path(key: str) -> Path:
+    return {
+        "stacks_dir": STACKS_DIR,
+        "vllm_dir": VLLM_DIR,
+        "beellama_stacks_dir": BEELLAMA_STACKS_DIR,
+        "llama_dir": LLAMA_DIR,
+        "models_dir": MODELS_DIR,
+        "beellama_dir": BEELLAMA_DIR,
+    }[key]
+
+
+def inspect_stack_dir(path: Path) -> dict:
+    """Validate a candidate folder from inside the container.
+
+    A host path that is not bind-mounted into this container simply does not exist
+    here, which is the most common way to get this wrong — so say that plainly.
+    """
+    info = {"exists": False, "is_dir": False, "readable": False, "yml_count": 0, "stack_count": 0}
+    try:
+        info["exists"] = path.exists()
+        info["is_dir"] = path.is_dir()
+        if not info["is_dir"]:
+            return info
+        ymls = sorted(path.glob("*.yml")) + sorted(path.glob("*.yaml"))
+        info["readable"] = True
+        info["yml_count"] = len(ymls)
+        info["stack_count"] = sum(
+            1 for p in ymls if parse_llm_meta(p).get("display_name")
+        )
+    except PermissionError:
+        info["readable"] = False
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
+def describe_settings() -> dict:
+    items = []
+    for d in SETTING_DEFS:
+        _, source = resolve_setting(d["key"], d["env"], "")
+        value = str(_current_setting_path(d["key"]))
+        item = {
+            "key": d["key"],
+            "label": d["label"],
+            "help": d["help"],
+            "value": value,
+            "source": source,
+            "env_name": d["env"],
+            "env_value": os.environ.get(d["env"]) or None,
+            "config_value": str(RUNTIME_CONFIG.get(d["key"])) if RUNTIME_CONFIG.get(d["key"]) else None,
+            "overridden": bool(USER_SETTINGS.get(d["key"])),
+        }
+        item.update(inspect_stack_dir(Path(value)))
+        item["scans"] = d["scans"]
+        items.append(item)
+    return {
+        "settings": items,
+        "settings_path": str(SETTINGS_PATH),
+        "writable": os.access(SETTINGS_PATH.parent, os.W_OK) if SETTINGS_PATH.parent.exists() else False,
+    }
+
+
+def apply_settings(new_values: dict) -> tuple[bool, str]:
+    """Persist and hot-apply directory settings. No restart needed for discovery."""
+    global USER_SETTINGS, LLAMA_DIR, STACKS_DIR, MODELS_DIR
+    global VLLM_DIR, BEELLAMA_DIR, BEELLAMA_STACKS_DIR
+    global _models_ts
+
+    cleaned = {}
+    for key, raw in new_values.items():
+        if key not in _SETTING_KEYS:
+            continue
+        if raw is None:
+            continue
+        val = str(raw).strip()
+        if not val:
+            continue  # empty means "fall back to env/config/default"
+        if not val.startswith("/"):
+            return False, f"{key}: path must be absolute (got {val!r})"
+        cleaned[key] = val.rstrip("/") or "/"
+
+    with SETTINGS_LOCK:
+        merged = dict(USER_SETTINGS)
+        for key in _SETTING_KEYS:
+            if key in new_values:
+                # Present-but-empty clears the override.
+                merged.pop(key, None)
+        merged.update(cleaned)
+        try:
+            SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SETTINGS_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+            tmp.replace(SETTINGS_PATH)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"Could not write {SETTINGS_PATH}: {exc}"
+        USER_SETTINGS = merged
+
+    LLAMA_DIR = Path(resolve_setting("llama_dir", "LLAMA_DIR", "/opt/llama.cpp")[0])
+    STACKS_DIR = Path(resolve_setting("stacks_dir", "STACKS_DIR", str(LLAMA_DIR / "stacks"))[0])
+    MODELS_DIR = Path(resolve_setting("models_dir", "MODELS_DIR", str(LLAMA_DIR / "models"))[0])
+    VLLM_DIR = Path(resolve_setting("vllm_dir", "VLLM_DIR", "/opt/vllm")[0])
+    BEELLAMA_DIR = Path(resolve_setting("beellama_dir", "BEELLAMA_DIR", "/opt/beellama.cpp")[0])
+    BEELLAMA_STACKS_DIR = Path(resolve_setting(
+        "beellama_stacks_dir", "BEELLAMA_STACKS_DIR", str(BEELLAMA_DIR / "stacks")
+    )[0])
+
+    _models_ts = 0.0  # force rediscovery on the next get_models()
+    _append_log_event("info", "settings", f"Settings updated: {', '.join(sorted(cleaned)) or 'cleared'}")
+    return True, "Settings saved"
 
 
 def discover_models() -> dict:
@@ -572,6 +794,56 @@ def _set_last_message(msg: str) -> None:
         STATE["last_message"] = msg
 
 
+# Categories that mean the load will never succeed. Seeing one of these is grounds for
+# ending the wait immediately instead of sitting on "Loading..." until the timeout.
+FATAL_LOAD_CATEGORIES = ("oom", "model_load", "config", "restart_loop")
+
+
+def _fatal_load_event_since(since_ts: float) -> dict | None:
+    """Newest fatal load event logged after `since_ts`, or None.
+
+    The timestamp filter matters: the event ring buffer outlives a switch, so without it
+    an error from a *previous* failed load is picked up the instant a new switch starts.
+    """
+    with LOG_LOCK:
+        events = list(LOG_STATE["events"])
+    for evt in reversed(events):
+        if evt.get("_ts_f", 0.0) < since_ts:
+            break
+        if evt.get("category") in FATAL_LOAD_CATEGORIES:
+            return evt
+    return None
+
+
+def _loading_progress_message_since(since_ts: float, label: str) -> str | None:
+    with LOG_LOCK:
+        events = list(LOG_STATE["events"])
+    for evt in reversed(events):
+        if evt.get("_ts_f", 0.0) < since_ts:
+            break
+        if evt.get("category") == "loading":
+            pct = re.search(r"(\d+(?:\.\d+)?)\s*[%％]", evt["message"])
+            return f"Loading {label}: {pct.group(1)}%" if pct else f"Loading {label}..."
+    return None
+
+
+def _clear_switch_state(message: str | None = None, *, log: str | None = None) -> bool:
+    """Drop out of the switching state. Returns True if a switch was actually in progress.
+
+    Every switch worker funnels its exit through here, including the exception path, so a
+    worker thread that dies unexpectedly can never strand the UI in "Loading...".
+    """
+    with STATE_LOCK:
+        was_active = bool(STATE["switch_in_progress"])
+        STATE["switch_in_progress"] = False
+        STATE["last_completed_at"] = now_iso()
+        if message is not None:
+            STATE["last_message"] = message
+    if was_active and log:
+        _append_log_event("warning", "switch", log)
+    return was_active
+
+
 def _append_log_event(severity: str, category: str, message: str) -> None:
     event = {
         "ts": now_iso(),
@@ -612,6 +884,14 @@ def _human_readable_path(path: str, body: dict | None = None) -> str:
     if path == "/api/benchmark":
         profile = (body or {}).get("profile", "balanced")
         return f"Run {profile} benchmark"
+    if path == "/api/metrics/history":
+        return "Metrics history"
+    if path == "/api/settings":
+        return "Dashboard settings"
+    if path == "/api/settings/inspect":
+        return "Inspect stack folder"
+    if path == "/api/switch/clear":
+        return "Clear stuck switch state"
     if path == "/api/reset":
         return "Emergency reset state"
     if path in ("/api/status",):
@@ -1823,10 +2103,55 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
         }
 
 
-def build_benchmark_prompt(estimated_tokens: int) -> str:
-    # Keep request bodies compact to avoid CLI argument limits while still driving token load.
-    repeats = max(32, estimated_tokens)
-    return ("x " * repeats).strip()
+# Common short English words: this tokenizes at ~1.0 tokens/word on the models we run,
+# so word count is a usable proxy for prompt token count without a /tokenize round trip.
+BENCHMARK_FILLER_WORDS = (
+    "time person year way day thing man world life hand part child eye woman place "
+    "work week case point government company number group problem fact water room "
+    "mother area money story month book job word business issue side kind head house "
+    "service friend father power hour game line end member law car city name team "
+    "minute idea kid body back parent face level office door health art war history "
+    "party result change morning reason research girl guy moment air teacher force "
+    "education river market winter copper wire table light rain ship coin train field "
+    "stone bridge glass paper metal wind cloud road window garden summer letter voice "
+    "number season picture street corner branch circle island valley"
+).split()
+
+BENCHMARK_TOKENS_PER_FILLER_WORD = 1.0
+
+# Instruction wrapper is ~75 tokens; subtract it so the requested prompt size is roughly honoured.
+BENCHMARK_PROMPT_OVERHEAD_TOKENS = 75
+
+BENCHMARK_TASK_INSTRUCTION = (
+    "TASK: Write a long, original, non-repetitive technical essay on the history of "
+    "memory hierarchies in computer architecture: caches, TLBs, NUMA, HBM. "
+    "Never repeat a sentence.\n\nESSAY:\n"
+)
+
+
+def build_benchmark_prompt(estimated_tokens: int, seed: int = 0) -> str:
+    """Build a benchmark prompt that produces *representative* generation work.
+
+    A prompt of one repeated token (the previous implementation) is a pathological
+    best case for speculative decoding: the drafter predicts every token, acceptance
+    hits ~100%, and reported generation throughput lands several times above what any
+    real request sees. Likewise, padding the prompt with coherent prose makes the model
+    copy that prose back, which the drafter also predicts perfectly.
+
+    So: high-entropy filler the model is told to ignore, plus a real instruction that
+    forces novel text. Deterministic per (estimated_tokens, seed) so runs are comparable.
+    """
+    pad_tokens = max(0, estimated_tokens - BENCHMARK_PROMPT_OVERHEAD_TOKENS)
+    word_count = max(16, int(round(pad_tokens / BENCHMARK_TOKENS_PER_FILLER_WORD)))
+    rnd = random.Random(seed * 7919 + estimated_tokens)
+    filler = " ".join(rnd.choice(BENCHMARK_FILLER_WORDS) for _ in range(word_count))
+    return (
+        "You are a throughput benchmark harness. The block below is opaque filler. "
+        "Do not read, repeat, quote, or refer to it.\n\nFILLER:\n"
+        + filler
+        + "\n\n"
+        + BENCHMARK_TASK_INSTRUCTION
+    )
 
 
 def _pick_float(d: dict, keys: list[str]) -> float | None:
@@ -1851,6 +2176,7 @@ def run_single_benchmark(
     *,
     prompt_tokens: int,
     n_predict: int,
+    seed: int = 0,
 ) -> tuple[dict | None, str | None]:
     container = find_model_server_container_name(active_key, containers)
     if not container:
@@ -1875,23 +2201,28 @@ def run_single_benchmark(
             except Exception:
                 pass
 
-        # vLLM OpenAI completions API
+        # vLLM OpenAI completions API.
+        # ignore_eos + min_tokens pin the generated token count to n_predict so every run
+        # measures the same amount of decode work. Sampling params are deliberately left
+        # to the server's own configuration so the benchmark reflects real serving settings.
         payload = {
             "model": model_id,
-            "prompt": build_benchmark_prompt(prompt_tokens),
+            "prompt": build_benchmark_prompt(prompt_tokens, seed),
             "max_tokens": n_predict,
-            "temperature": 0.0,
+            "min_tokens": n_predict,
+            "ignore_eos": True,
             "stream": True,
             "stream_options": {"include_usage": True}
         }
         endpoint = f"http://127.0.0.1:{port}/v1/completions"
     else:
-        # llama.cpp / BeeLlama completions API
+        # llama.cpp / BeeLlama completions API.
+        # cache_prompt=False defeats the prompt cache so prefill is actually measured;
+        # ignore_eos pins predicted_n to n_predict. Sampling is left to the server config.
         payload = {
-            "prompt": build_benchmark_prompt(prompt_tokens),
+            "prompt": build_benchmark_prompt(prompt_tokens, seed),
             "n_predict": n_predict,
-            "temperature": 0.0,
-            "top_p": 1.0,
+            "ignore_eos": True,
             "stream": False,
             "cache_prompt": False,
         }
@@ -1977,6 +2308,10 @@ def run_single_benchmark(
                 "gen_tps": gen_tps,
                 "prompt_tokens": prompt_n,
                 "gen_tokens": gen_n,
+                # Expose the same ms fields llama.cpp gives us so the full-profile
+                # aggregate can weight every run the same way.
+                "prompt_ms": ttft * 1000.0,
+                "gen_ms": max(0.0, gen_duration) * 1000.0,
                 "is_vllm": True,
                 "duration_sec": duration,
                 "ttft_sec": ttft
@@ -2000,6 +2335,15 @@ def run_single_benchmark(
     if prefill_tps is None or gen_tps is None:
         return None, "Benchmark timings incomplete in llama.cpp response"
 
+    # Speculative-decoding acceptance rate. A run sitting near 100% means the drafter is
+    # predicting the output almost perfectly, which inflates gen_tps far above what real
+    # traffic sees — surface it so an unrepresentative benchmark is visible, not silent.
+    draft_n = timings.get("draft_n")
+    draft_accepted = timings.get("draft_n_accepted")
+    draft_acceptance = None
+    if isinstance(draft_n, (int, float)) and draft_n > 0 and isinstance(draft_accepted, (int, float)):
+        draft_acceptance = float(draft_accepted) / float(draft_n)
+
     return (
         {
             "container": container,
@@ -2009,6 +2353,9 @@ def run_single_benchmark(
             "gen_tokens": timings.get("predicted_n"),
             "prompt_ms": timings.get("prompt_ms"),
             "gen_ms": timings.get("predicted_ms"),
+            "draft_n": draft_n,
+            "draft_n_accepted": draft_accepted,
+            "draft_acceptance": draft_acceptance,
         },
         None,
     )
@@ -2046,6 +2393,7 @@ def run_benchmark_profile(
                     containers,
                     prompt_tokens=spec["prompt_tokens"],
                     n_predict=spec["n_predict"],
+                    seed=rep,
                 )
                 if error:
                     return None, f"Full benchmark failed on {spec['name']} (run {rep + 1}/{repeats}): {error}"
@@ -2054,18 +2402,40 @@ def run_benchmark_profile(
                 run["requested_n_predict"] = spec["n_predict"]
                 runs.append(run)
 
-        prefill_avg = sum(float(r["prefill_tps"]) for r in runs) / len(runs)
-        gen_avg = sum(float(r["gen_tps"]) for r in runs) / len(runs)
+        prompt_tokens_total = sum(int(r.get("prompt_tokens") or 0) for r in runs)
+        gen_tokens_total = sum(int(r.get("gen_tokens") or 0) for r in runs)
+        prompt_ms_total = sum(float(r.get("prompt_ms") or 0.0) for r in runs)
+        gen_ms_total = sum(float(r.get("gen_ms") or 0.0) for r in runs)
+
+        # Token-weighted, not a mean of per-run rates. The specs span 32 to 2048 generated
+        # tokens; averaging their rates lets the shortest, noisiest runs count as much as
+        # the long ones. Total tokens over total time is the throughput that actually held.
+        if prompt_ms_total > 0 and prompt_tokens_total > 0:
+            prefill_avg = prompt_tokens_total / (prompt_ms_total / 1000.0)
+        else:
+            prefill_avg = sum(float(r["prefill_tps"]) for r in runs) / len(runs)
+        if gen_ms_total > 0 and gen_tokens_total > 0:
+            gen_avg = gen_tokens_total / (gen_ms_total / 1000.0)
+        else:
+            gen_avg = sum(float(r["gen_tps"]) for r in runs) / len(runs)
+
+        draft_n_total = sum(int(r.get("draft_n") or 0) for r in runs)
+        draft_accepted_total = sum(int(r.get("draft_n_accepted") or 0) for r in runs)
+        draft_acceptance = (draft_accepted_total / draft_n_total) if draft_n_total > 0 else None
+
         return (
             {
                 "profile": "full",
                 "container": runs[0]["container"],
                 "prefill_tps": prefill_avg,
                 "gen_tps": gen_avg,
-                "prompt_tokens": sum(int(r.get("prompt_tokens") or 0) for r in runs),
-                "gen_tokens": sum(int(r.get("gen_tokens") or 0) for r in runs),
-                "prompt_ms": sum(float(r.get("prompt_ms") or 0.0) for r in runs),
-                "gen_ms": sum(float(r.get("gen_ms") or 0.0) for r in runs),
+                "prompt_tokens": prompt_tokens_total,
+                "gen_tokens": gen_tokens_total,
+                "prompt_ms": prompt_ms_total,
+                "gen_ms": gen_ms_total,
+                "draft_n": draft_n_total or None,
+                "draft_n_accepted": draft_accepted_total or None,
+                "draft_acceptance": draft_acceptance,
                 "runs": runs,
             },
             None,
@@ -2107,68 +2477,66 @@ def start_switch(model_key: str) -> tuple[bool, str]:
     _append_log_event("info", "switch", f"Switch requested: {model['label']}")
 
     def _worker() -> None:
-        # Stop BeeLlama if running before starting a llama.cpp model
-        if BEELLAMA_DIR.is_dir():
-            _stop_beellama()
-        compose_path = model["compose"]
-        cmd = [
-            "bash",
-            "-lc",
-            f"cd {shlex.quote(str(LLAMA_DIR))} && {shlex.quote(str(SWITCH_SCRIPT))} --stack {shlex.quote(compose_path)}",
-        ]
-        exit_code, output = run_command(cmd)
-        if exit_code != 0:
-            with STATE_LOCK:
-                STATE["switch_in_progress"] = False
-                STATE["last_completed_at"] = now_iso()
-                STATE["last_exit_code"] = exit_code
-                STATE["last_output"] = output[-4000:]
-                STATE["last_message"] = f"Switch failed for {model['label']}"
-            _append_log_event("error", "switch", f"Switch failed for {model['label']} (exit {exit_code})")
-            return
-
-        with STATE_LOCK:
-            STATE["last_exit_code"] = exit_code
-            STATE["last_output"] = output[-4000:]
-            STATE["last_message"] = f"Loading {model['label']}..."
-
-        # Poll until healthy, surfacing log events in last_message
-        deadline = time.time() + SWITCH_READY_TIMEOUT_SEC
-        while time.time() < deadline:
-            local_containers = list_llama_compose_containers()
-            if is_model_server_healthy(model_key, local_containers):
+        switch_started_ts = time.time()
+        try:
+            # Stop BeeLlama if running before starting a llama.cpp model
+            if BEELLAMA_DIR.is_dir():
+                _stop_beellama()
+            compose_path = model["compose"]
+            cmd = [
+                "bash",
+                "-lc",
+                f"cd {shlex.quote(str(LLAMA_DIR))} && {shlex.quote(str(SWITCH_SCRIPT))} --stack {shlex.quote(compose_path)}",
+            ]
+            exit_code, output = run_command(cmd)
+            if exit_code != 0:
                 with STATE_LOCK:
-                    STATE["switch_in_progress"] = False
-                    STATE["last_completed_at"] = now_iso()
-                    STATE["last_message"] = f"Ready: {model['label']}"
-                _append_log_event("info", "switch", f"Switch complete: {model['label']} is ready")
+                    STATE["last_exit_code"] = exit_code
+                    STATE["last_output"] = output[-4000:]
+                _clear_switch_state(f"Switch failed for {model['label']}")
+                _append_log_event("error", "switch", f"Switch failed for {model['label']} (exit {exit_code})")
                 return
 
-            with LOG_LOCK:
-                recent_events = list(LOG_STATE["events"])
-            error_found = False
-            for evt in reversed(recent_events):
-                if evt["category"] in ("oom", "model_load", "config", "restart_loop"):
-                    _set_last_message(f"Error loading {model['label']}: {evt['message'][:80]}")
-                    error_found = True
-                    break
-            if not error_found:
-                for evt in reversed(recent_events):
-                    if evt["category"] == "loading":
-                        pct = re.search(r"(\d+(?:\.\d+)?)\s*[%％]", evt["message"])
-                        if pct:
-                            _set_last_message(f"Loading {model['label']}: {pct.group(1)}%")
-                        else:
-                            _set_last_message(f"Loading {model['label']}...")
-                        break
+            with STATE_LOCK:
+                STATE["last_exit_code"] = exit_code
+                STATE["last_output"] = output[-4000:]
+                STATE["last_message"] = f"Loading {model['label']}..."
 
-            time.sleep(SWITCH_POLL_SEC)
+            # Poll until healthy, surfacing log events in last_message
+            deadline = time.time() + SWITCH_READY_TIMEOUT_SEC
+            while time.time() < deadline:
+                local_containers = list_llama_compose_containers()
+                if is_model_server_healthy(model_key, local_containers):
+                    _clear_switch_state(f"Ready: {model['label']}")
+                    _append_log_event("info", "switch", f"Switch complete: {model['label']} is ready")
+                    return
 
-        with STATE_LOCK:
-            STATE["switch_in_progress"] = False
-            STATE["last_completed_at"] = now_iso()
-            STATE["last_message"] = f"Load timeout for {model['label']}"
-        _append_log_event("error", "switch", f"Switch timeout: {model['label']} did not become healthy within {SWITCH_READY_TIMEOUT_SEC}s")
+                # A crash during load is terminal — stop waiting instead of showing
+                # "Loading..." for the rest of SWITCH_READY_TIMEOUT_SEC.
+                fatal = _fatal_load_event_since(switch_started_ts)
+                if fatal is not None:
+                    _clear_switch_state(f"Load failed for {model['label']}: {fatal['message'][:120]}")
+                    _append_log_event(
+                        "error", "switch",
+                        f"Load aborted for {model['label']}: {fatal['category']}: {fatal['message'][:160]}",
+                    )
+                    return
+
+                progress = _loading_progress_message_since(switch_started_ts, model["label"])
+                if progress:
+                    _set_last_message(progress)
+
+                time.sleep(SWITCH_POLL_SEC)
+
+            _clear_switch_state(f"Load timeout for {model['label']}")
+            _append_log_event("error", "switch", f"Switch timeout: {model['label']} did not become healthy within {SWITCH_READY_TIMEOUT_SEC}s")
+        except Exception as exc:
+            # Without this the thread dies silently and switch_in_progress stays True forever,
+            # which locks every model button in the UI.
+            _clear_switch_state(f"Switch error for {model['label']}: {exc}")
+            _append_log_event("error", "switch", f"Switch worker crashed for {model['label']}: {exc}")
+        finally:
+            _clear_switch_state()
 
     threading.Thread(target=_worker, daemon=True).start()
     return True, f"Switch request accepted: {model['label']}"
@@ -2200,6 +2568,7 @@ def start_vllm_switch(
     _append_log_event("info", "switch", f"Switch requested: {label}")
 
     def _vllm_worker() -> None:
+        switch_started_ts = time.time()
         try:
             # Stop llama.cpp if it is active
             if current_active and not _key_is_vllm(current_active):
@@ -2258,25 +2627,27 @@ def start_vllm_switch(
                 time.sleep(SWITCH_POLL_SEC)
                 local_vllm = list_vllm_compose_containers()
                 if is_vllm_healthy(local_vllm):
-                    with STATE_LOCK:
-                        STATE["switch_in_progress"] = False
-                        STATE["last_completed_at"] = now_iso()
-                        STATE["last_message"] = f"Ready: {label}"
+                    _clear_switch_state(f"Ready: {label}")
                     _append_log_event("info", "switch", f"Ready: {label}")
                     return
 
-            with STATE_LOCK:
-                STATE["switch_in_progress"] = False
-                STATE["last_completed_at"] = now_iso()
-                STATE["last_message"] = f"{label} load timeout"
+                fatal = _fatal_load_event_since(switch_started_ts)
+                if fatal is not None:
+                    _clear_switch_state(f"Load failed for {label}: {fatal['message'][:120]}")
+                    _append_log_event(
+                        "error", "switch",
+                        f"Load aborted for {label}: {fatal['category']}: {fatal['message'][:160]}",
+                    )
+                    return
+
+            _clear_switch_state(f"{label} load timeout")
             _append_log_event("error", "switch", f"{label} load timeout")
 
         except Exception as exc:
             _append_log_event("error", "switch", f"vLLM switch error: {exc}")
-            with STATE_LOCK:
-                STATE["switch_in_progress"] = False
-                STATE["last_completed_at"] = now_iso()
-                STATE["last_message"] = f"vLLM switch error: {exc}"
+            _clear_switch_state(f"vLLM switch error: {exc}")
+        finally:
+            _clear_switch_state()
 
     threading.Thread(target=_vllm_worker, daemon=True).start()
     return True, f"Switch to {label} accepted"
@@ -2329,6 +2700,7 @@ def start_beellama_switch(model_key: str) -> tuple[bool, str]:
     _append_log_event("info", "switch", f"Switch requested: {model.get('label', 'BeeLlama')}")
 
     def _beellama_worker() -> None:
+        switch_started_ts = time.time()
         try:
             compose_file = _get_beellama_compose_file(model)
             compose_file_q = shlex.quote(str(compose_file))
@@ -2380,28 +2752,33 @@ def start_beellama_switch(model_key: str) -> tuple[bool, str]:
                 STATE["last_output"] = output[-4000:]
                 STATE["last_message"] = f"Loading {model.get('label', 'BeeLlama')}..."
 
+            bee_label = model.get("label", "BeeLlama")
             deadline = time.time() + SWITCH_READY_TIMEOUT_SEC
             while time.time() < deadline:
                 local_containers = list_llama_compose_containers()
                 if is_model_server_healthy(model_key, local_containers):
-                    with STATE_LOCK:
-                        STATE["switch_in_progress"] = False
-                        STATE["last_completed_at"] = now_iso()
-                        STATE["last_message"] = f"Ready: {model.get('label', 'BeeLlama')}"
-                    _append_log_event("info", "switch", f"Switch complete: {model.get('label', 'BeeLlama')} is ready")
+                    _clear_switch_state(f"Ready: {bee_label}")
+                    _append_log_event("info", "switch", f"Switch complete: {bee_label} is ready")
                     return
+
+                fatal = _fatal_load_event_since(switch_started_ts)
+                if fatal is not None:
+                    _clear_switch_state(f"Load failed for {bee_label}: {fatal['message'][:120]}")
+                    _append_log_event(
+                        "error", "switch",
+                        f"Load aborted for {bee_label}: {fatal['category']}: {fatal['message'][:160]}",
+                    )
+                    return
+
                 time.sleep(SWITCH_POLL_SEC)
 
-            with STATE_LOCK:
-                STATE["switch_in_progress"] = False
-                STATE["last_completed_at"] = now_iso()
-                STATE["last_message"] = f"Load timeout for {model.get('label', 'BeeLlama')}"
+            _clear_switch_state(f"Load timeout for {bee_label}")
             _append_log_event("error", "switch", "BeeLlama load timeout")
         except Exception as e:
-            with STATE_LOCK:
-                STATE["switch_in_progress"] = False
-                STATE["last_message"] = f"BeeLlama switch error: {e}"
+            _clear_switch_state(f"BeeLlama switch error: {e}")
             _append_log_event("error", "switch", f"BeeLlama switch error: {e}")
+        finally:
+            _clear_switch_state()
 
     threading.Thread(target=_beellama_worker, daemon=True).start()
     return True, f"Switch request accepted: {model.get('label', 'BeeLlama')}"
@@ -2478,6 +2855,329 @@ def _get_proc_gpu_pct(pids: set[int]) -> dict[int, float]:
             except (ValueError, IndexError):
                 pass
     return result
+
+
+def _metrics_connect(readonly: bool = False):
+    if readonly:
+        return sqlite3.connect(f"file:{METRICS_DB}?mode=ro", uri=True, timeout=5.0)
+    return sqlite3.connect(METRICS_DB, timeout=5.0)
+
+
+def init_metrics_db() -> bool:
+    """Create the samples table. Returns False if the volume is not writable."""
+    global METRICS_DB_READY
+    try:
+        parent = os.path.dirname(METRICS_DB)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with METRICS_DB_LOCK:
+            conn = _metrics_connect()
+            try:
+                # WAL so the sampler's writes never block a dashboard read.
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS samples (
+                        ts       INTEGER PRIMARY KEY,
+                        util     REAL,
+                        vram_pct REAL,
+                        vram_mb  REAL,
+                        tps      REAL,
+                        ingest   REAL,
+                        power    REAL,
+                        temp     REAL,
+                        fan      REAL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS benchmarks (
+                        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts               INTEGER NOT NULL,
+                        profile          TEXT,
+                        model_key        TEXT,
+                        model_label      TEXT,
+                        success          INTEGER,
+                        prefill_tps      REAL,
+                        gen_tps          REAL,
+                        draft_acceptance REAL,
+                        duration_sec     REAL,
+                        error            TEXT,
+                        started_at       TEXT,
+                        completed_at     TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_benchmarks_model "
+                    "ON benchmarks (model_key, success, ts DESC)"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        METRICS_DB_READY = True
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _append_log_event("warning", "metrics", f"Metrics history disabled: {exc}")
+        METRICS_DB_READY = False
+        return False
+
+
+def note_live_throughput(tps, ingest) -> None:
+    """Cache the newest throughput reading for the sampler.
+
+    Throughput costs a docker exec to measure; the status endpoint already pays for it
+    on every poll, so the sampler reuses that instead of doubling the load.
+    """
+    with METRICS_LIVE_LOCK:
+        METRICS_LIVE["ts"] = time.time()
+        METRICS_LIVE["tps"] = float(tps) if isinstance(tps, (int, float)) else None
+        METRICS_LIVE["ingest"] = float(ingest) if isinstance(ingest, (int, float)) else None
+
+
+def record_metric_sample() -> None:
+    gpus = get_gpu_stats()
+    if not gpus:
+        return
+    gpu = gpus[0]
+
+    with METRICS_LIVE_LOCK:
+        fresh = (time.time() - METRICS_LIVE["ts"]) <= METRICS_LIVE_MAX_AGE_SEC
+        tps = METRICS_LIVE["tps"] if fresh else None
+        ingest = METRICS_LIVE["ingest"] if fresh else None
+
+    mem_total = gpu.get("mem_total") or 0
+    mem_used = gpu.get("mem_used") or 0
+    vram_pct = (mem_used / mem_total * 100.0) if mem_total > 0 else None
+
+    row = (
+        int(time.time()),
+        gpu.get("util"),
+        vram_pct,
+        mem_used or None,
+        tps,
+        ingest,
+        gpu.get("power"),
+        gpu.get("temp"),
+        gpu.get("fan"),
+    )
+    with METRICS_DB_LOCK:
+        conn = _metrics_connect()
+        try:
+            # One row per wall-clock second; REPLACE keeps a restart from colliding.
+            conn.execute(
+                "INSERT OR REPLACE INTO samples "
+                "(ts, util, vram_pct, vram_mb, tps, ingest, power, temp, fan) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                row,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def prune_metrics() -> None:
+    cutoff = int(time.time() - METRICS_RETENTION_DAYS * 86400)
+    with METRICS_DB_LOCK:
+        conn = _metrics_connect()
+        try:
+            conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def read_metrics_history(range_key: str) -> dict:
+    """Bucket-averaged samples for a range, capped at METRICS_MAX_POINTS points."""
+    span = METRICS_RANGES.get(range_key)
+    if span is None:
+        return {"error": "Unknown range", "points": []}
+    if not METRICS_DB_READY or not os.path.exists(METRICS_DB):
+        return {"error": "Metrics history unavailable", "points": [], "range": range_key}
+
+    bucket = max(int(METRICS_SAMPLE_SEC), span // METRICS_MAX_POINTS)
+    since = int(time.time()) - span
+    try:
+        conn = _metrics_connect(readonly=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            rows = conn.execute(
+                """
+                SELECT (ts / ?) * ?        AS b,
+                       AVG(util)           AS util,
+                       AVG(vram_pct)       AS vram_pct,
+                       AVG(power)          AS power,
+                       AVG(temp)           AS temp,
+                       AVG(fan)            AS fan,
+                       AVG(tps)            AS tps,
+                       MAX(tps)            AS tps_max,
+                       AVG(ingest)         AS ingest,
+                       MAX(ingest)         AS ingest_max
+                FROM samples
+                WHERE ts >= ?
+                GROUP BY b
+                ORDER BY b
+                """,
+                (bucket, bucket, since),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "points": [], "range": range_key}
+
+    rnd = lambda v: round(v, 2) if isinstance(v, (int, float)) else None  # noqa: E731
+    points = [
+        {
+            "t": int(r[0]),
+            "util": rnd(r[1]),
+            "vram_pct": rnd(r[2]),
+            "power": rnd(r[3]),
+            "temp": rnd(r[4]),
+            "fan": rnd(r[5]),
+            "tps": rnd(r[6]),
+            "tps_max": rnd(r[7]),
+            "ingest": rnd(r[8]),
+            "ingest_max": rnd(r[9]),
+        }
+        for r in rows
+    ]
+    return {
+        "range": range_key,
+        "span_sec": span,
+        "bucket_sec": bucket,
+        "points": points,
+        "error": None,
+    }
+
+
+def save_benchmark_run(entry: dict) -> None:
+    """Persist one benchmark history entry. Benchmarks used to live only in memory,
+    so every container rebuild wiped the record."""
+    if not METRICS_DB_READY:
+        return
+    try:
+        with METRICS_DB_LOCK:
+            conn = _metrics_connect()
+            try:
+                conn.execute(
+                    "INSERT INTO benchmarks (ts, profile, model_key, model_label, success, "
+                    "prefill_tps, gen_tps, draft_acceptance, duration_sec, error, "
+                    "started_at, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        int(time.time()),
+                        entry.get("profile"),
+                        entry.get("model_key"),
+                        entry.get("model_label"),
+                        1 if entry.get("success") else 0,
+                        entry.get("prefill_tps"),
+                        entry.get("gen_tps"),
+                        entry.get("draft_acceptance"),
+                        entry.get("duration_sec"),
+                        entry.get("error"),
+                        entry.get("started_at"),
+                        entry.get("completed_at"),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:  # noqa: BLE001
+        _append_log_event("warning", "benchmark", f"Could not persist benchmark run: {exc}")
+
+
+_BENCHMARK_ROW_COLUMNS = (
+    "profile", "model_key", "model_label", "success", "prefill_tps", "gen_tps",
+    "draft_acceptance", "duration_sec", "error", "started_at", "completed_at",
+)
+
+
+def load_benchmark_history(limit: int = FULL_BENCHMARK_MAX_HISTORY) -> list[dict]:
+    if not METRICS_DB_READY or not os.path.exists(METRICS_DB):
+        return []
+    try:
+        conn = _metrics_connect(readonly=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"SELECT {','.join(_BENCHMARK_ROW_COLUMNS)} FROM benchmarks "
+                "ORDER BY ts DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return []
+    # Stored newest-first; the in-memory history is oldest-first.
+    out = []
+    for r in reversed(rows):
+        d = dict(r)
+        d["success"] = bool(d["success"])
+        out.append(d)
+    return out
+
+
+def model_benchmark_summary() -> dict:
+    """Most recent successful benchmark per model, for the sidebar cards."""
+    if not METRICS_DB_READY or not os.path.exists(METRICS_DB):
+        return {}
+    try:
+        conn = _metrics_connect(readonly=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            rows = conn.execute(
+                """
+                SELECT b.model_key, b.profile, b.prefill_tps, b.gen_tps,
+                       b.draft_acceptance, b.ts
+                FROM benchmarks b
+                JOIN (
+                    SELECT model_key, MAX(ts) AS ts
+                    FROM benchmarks
+                    WHERE success = 1 AND model_key IS NOT NULL
+                    GROUP BY model_key
+                ) latest
+                  ON latest.model_key = b.model_key AND latest.ts = b.ts
+                WHERE b.success = 1
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return {}
+    return {
+        r[0]: {
+            "profile": r[1],
+            "prefill_tps": r[2],
+            "gen_tps": r[3],
+            "draft_acceptance": r[4],
+            "ts": r[5],
+        }
+        for r in rows
+    }
+
+
+def restore_benchmark_history() -> None:
+    rows = load_benchmark_history()
+    if not rows:
+        return
+    with BENCHMARK_LOCK:
+        BENCHMARK_STATE["history"] = rows[-FULL_BENCHMARK_MAX_HISTORY:]
+
+
+def _run_metrics_sampler() -> None:
+    last_prune = 0.0
+    while True:
+        try:
+            record_metric_sample()
+            now = time.time()
+            if now - last_prune > METRICS_PRUNE_EVERY_SEC:
+                prune_metrics()
+                last_prune = now
+        except Exception as exc:  # noqa: BLE001
+            _append_log_event("warning", "metrics", f"Metrics sampler error: {exc}")
+        time.sleep(METRICS_SAMPLE_SEC)
 
 
 def get_gpu_processes() -> list[dict]:
@@ -2581,6 +3281,12 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
     throughput = build_throughput_status(active_key, containers)
     live_throughput = build_live_throughput_status(active_key, containers)
     model_stats = build_model_stats(active_key, live_throughput, throughput)
+    # Hand the freshly-measured throughput to the metrics sampler so it never has to
+    # run its own docker exec to get the same numbers.
+    note_live_throughput(
+        model_stats.get("live_tps"),
+        model_stats.get("last_live_ingest_tps") or model_stats.get("last_ingest_tps"),
+    )
 
     context_info = {"n_ctx": None, "n_past": None}
     if _key_is_vllm(active_key) and throughput.get("gpu_cache_usage_perc") is not None:
@@ -2651,21 +3357,24 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
                         "warning", "benchmark",
                         f"Benchmark auto-reset after {int(age)}s (stale)",
                     )
-                    BENCHMARK_STATE["history"].append(
-                        {
-                            "profile": BENCHMARK_STATE.get("profile", "balanced"),
-                            "model_key": active_key,
-                            "started_at": BENCHMARK_STATE.get("started_at"),
-                            "completed_at": BENCHMARK_STATE.get("completed_at"),
-                            "duration_sec": age,
-                            "success": False,
-                            "error": BENCHMARK_STATE["last_error"],
-                        }
-                    )
+                    stale_entry = {
+                        "profile": BENCHMARK_STATE.get("profile", "balanced"),
+                        "model_key": active_key,
+                        "model_label": (models.get(active_key) or {}).get("label") or active_key,
+                        "started_at": BENCHMARK_STATE.get("started_at"),
+                        "completed_at": BENCHMARK_STATE.get("completed_at"),
+                        "duration_sec": age,
+                        "success": False,
+                        "error": BENCHMARK_STATE["last_error"],
+                    }
+                    BENCHMARK_STATE["history"].append(stale_entry)
+                    save_benchmark_run(stale_entry)
                     BENCHMARK_STATE["history"] = BENCHMARK_STATE["history"][-FULL_BENCHMARK_MAX_HISTORY:]
 
     with BENCHMARK_LOCK:
         benchmark = dict(BENCHMARK_STATE)
+
+    bench_by_model = model_benchmark_summary()
 
     status = {
         "active": active,
@@ -2694,6 +3403,9 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
                 "ctx_size": m["ctx_size"],
                 "quant": m["quant"],
                 "params": m["params"],
+                # Latest successful benchmark for this model, so the sidebar card can
+                # show measured speeds without the model being loaded.
+                "bench": bench_by_model.get(key),
             }
             for key, m in models.items()
         ],
@@ -2725,22 +3437,31 @@ INDEX_HTML = r"""<!doctype html>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     :root {
-      --bg: #030712;
-      --sidebar-bg: #0a0f1a;
-      --card: #111827;
-      --card-active: #1e293b;
-      --border: #1f2937;
-      --border-strong: #374151;
-      --text: #f9fafb;
-      --text-muted: #6b7280;
-      --text-dim: #9ca3af;
-      --accent: #3b82f6;
-      --success: #10b981;
-      --warning: #f59e0b;
-      --danger: #ef4444;
-      --sidebar-w: 260px;
-      --header-h: 56px;
-      --font-mono: 'JetBrains Mono', 'Fira Code', 'Roboto Mono', monospace;
+      --bg: #06080f;
+      --bg-glow-1: rgba(59,130,246,0.10);
+      --bg-glow-2: rgba(16,185,129,0.07);
+      --sidebar-bg: #0a0e18;
+      --card: #0e1320;
+      --card-hi: #131a2b;
+      --card-active: #1b2438;
+      --border: #1b2334;
+      --border-strong: #2b364c;
+      --text: #f4f7fb;
+      --text-muted: #7c8798;
+      --text-dim: #a7b2c4;
+      --accent: #4f8dfb;
+      --accent-soft: rgba(79,141,251,0.14);
+      --success: #21c98a;
+      --warning: #f5a524;
+      --danger: #f2555a;
+      --sidebar-w: 268px;
+      --header-h: 58px;
+      --radius: 14px;
+      --radius-sm: 9px;
+      --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 8px 24px -12px rgba(0,0,0,0.7);
+      --shadow-lg: 0 24px 60px -20px rgba(0,0,0,0.85);
+      --ease: cubic-bezier(0.4, 0, 0.2, 1);
+      --font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Roboto Mono', monospace;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; overflow: hidden; }
@@ -3017,11 +3738,6 @@ INDEX_HTML = r"""<!doctype html>
       gap: 18px;
       align-items: start;
     }
-    .main-column {
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-    }
     .chart-panel {
       background: var(--card);
       border: 1px solid var(--border-strong);
@@ -3103,8 +3819,6 @@ INDEX_HTML = r"""<!doctype html>
     @media (max-width: 1200px) {
       .stats-row { grid-template-columns: repeat(3, 1fr); }
       .content-grid { grid-template-columns: 1fr; }
-      .main-column { order: 1; }
-      .info-panel { order: 2; }
     }
     @media (max-width: 900px) {
       .stats-row { grid-template-columns: repeat(3, 1fr); }
@@ -3245,6 +3959,559 @@ INDEX_HTML = r"""<!doctype html>
     .rd-raw summary { cursor:pointer; color:var(--text-muted); font-size:11px; font-weight:700; }
     .rd-raw pre { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:12px; overflow:auto; max-height:320px; font-size:11px; color:var(--text-dim); margin-top:8px; white-space:pre-wrap; word-break:break-word; }
     .rd-note { color:var(--text-muted); font-size:12px; font-style:italic; }
+
+    /* ══════════════════════════════════════════════════════════════════════
+       Visual refresh. Layered on top of the rules above so the structural
+       CSS stays readable and every selector here is an intentional override.
+       ══════════════════════════════════════════════════════════════════════ */
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      /* Two soft light sources keep the flat near-black from reading as dead space. */
+      background:
+        radial-gradient(1100px 620px at 12% -12%, var(--bg-glow-1), transparent 62%),
+        radial-gradient(900px 520px at 92% 0%, var(--bg-glow-2), transparent 58%),
+        var(--bg);
+      background-attachment: fixed;
+    }
+
+    /* Numbers that change every second must not reflow their own width. */
+    .stat-value, .info-value, .event-ts, .reqlog-time, td, .bh-metric, .switch-elapsed {
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
+    }
+
+    /* Scrollbars: Firefox + WebKit, consistent everywhere. */
+    * { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+    ::-webkit-scrollbar { width: 9px; height: 9px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 99px; border: 2px solid transparent; background-clip: content-box; }
+    ::-webkit-scrollbar-thumb:hover { background: #3d4a63; background-clip: content-box; }
+
+    /* One visible keyboard focus treatment for every interactive element. */
+    a:focus-visible, button:focus-visible, input:focus-visible,
+    select:focus-visible, summary:focus-visible, .model-row:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      border-radius: var(--radius-sm);
+    }
+
+    /* ── Header ── */
+    .app-header {
+      background: linear-gradient(180deg, rgba(16,22,36,0.92), rgba(10,14,24,0.82));
+      backdrop-filter: blur(14px) saturate(160%);
+      -webkit-backdrop-filter: blur(14px) saturate(160%);
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      padding: 0 22px;
+      gap: 14px;
+    }
+    .brand {
+      font-size: 13px; font-weight: 800; letter-spacing: 1.6px;
+      background: linear-gradient(92deg, #7fb2ff, #56e0b0);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent; color: transparent;
+      white-space: nowrap;
+    }
+    .status-badge {
+      background: rgba(255,255,255,0.045);
+      border: 1px solid rgba(255,255,255,0.09);
+      border-radius: 999px;
+      padding: 5px 13px;
+      font-size: 11px; letter-spacing: 0.8px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+      white-space: nowrap;
+    }
+    .status-dot { width: 7px; height: 7px; }
+    .dot-success { box-shadow: 0 0 0 3px rgba(33,201,138,0.16), 0 0 10px var(--success); }
+    .dot-danger  { box-shadow: 0 0 0 3px rgba(242,85,90,0.16); }
+    .dot-warning { box-shadow: 0 0 0 3px rgba(245,165,36,0.16); }
+    .menu-toggle { border-radius: var(--radius-sm); border-color: rgba(255,255,255,0.1); transition: background 0.15s var(--ease); }
+
+    /* ── Sidebar ── */
+    .sidebar { background: linear-gradient(180deg, #0b101c, #080c15); border-right: 1px solid rgba(255,255,255,0.055); }
+    .nav-link { border-radius: var(--radius-sm); transition: background 0.15s var(--ease), color 0.15s var(--ease), transform 0.12s var(--ease); }
+    .nav-link:hover { background: rgba(255,255,255,0.055); transform: translateX(2px); }
+    .family-label { transition: color 0.15s var(--ease); }
+    .family-label:hover { color: var(--text-dim); }
+    .model-row {
+      margin: 2px 8px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      border-left: 0;
+      border: 1px solid transparent;
+      transition: background 0.15s var(--ease), border-color 0.15s var(--ease), transform 0.12s var(--ease);
+    }
+    .model-row:hover { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.07); transform: translateX(2px); }
+    .model-row.active {
+      background: linear-gradient(90deg, rgba(33,201,138,0.16), rgba(33,201,138,0.045));
+      border-color: rgba(33,201,138,0.32);
+    }
+    /* The removed left border used to mark the active row; a dot does it without shifting layout. */
+    .model-row.active::before {
+      content: ''; position: absolute; left: 4px; top: 50%; transform: translateY(-50%);
+      width: 3px; height: 20px; border-radius: 99px; background: var(--success);
+      box-shadow: 0 0 10px rgba(33,201,138,0.8);
+    }
+    .tag-pill { border-radius: 5px; padding: 1.5px 5px; letter-spacing: 0.3px; }
+    .sidebar-search { border-radius: 9px; padding: 8px 11px; transition: border-color 0.15s var(--ease), background 0.15s var(--ease); }
+
+    .btn-restart, .btn-stop-all, .btn-benchmark, .btn-benchmark-full {
+      border-radius: 10px;
+      padding: 9px;
+      transition: background 0.15s var(--ease), transform 0.12s var(--ease), box-shadow 0.15s var(--ease);
+    }
+    .btn-restart:hover:not(:disabled), .btn-stop-all:hover:not(:disabled),
+    .btn-benchmark:hover:not(:disabled), .btn-benchmark-full:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px -8px rgba(0,0,0,0.9);
+    }
+    .btn-restart:active:not(:disabled), .btn-stop-all:active:not(:disabled),
+    .btn-benchmark:active:not(:disabled), .btn-benchmark-full:active:not(:disabled) { transform: translateY(0); }
+
+    /* ── Surfaces ── */
+    .stat-card, .chart-panel, .info-panel, .table-panel, .activity-panel {
+      background: linear-gradient(168deg, var(--card-hi), var(--card));
+      border: 1px solid rgba(255,255,255,0.065);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+    .stat-card {
+      position: relative;
+      overflow: hidden;
+      transition: border-color 0.18s var(--ease), transform 0.18s var(--ease);
+    }
+    /* Hairline of light along the top edge — reads as a lit surface, not a flat rectangle. */
+    .stat-card::after {
+      content: ''; position: absolute; inset: 0 0 auto 0; height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.16), transparent);
+    }
+    .stat-card:hover { border-color: rgba(255,255,255,0.12); transform: translateY(-2px); }
+    .stat-label { font-size: 10px; letter-spacing: 0.9px; color: var(--text-muted); }
+    .stat-value { font-size: 27px; letter-spacing: -0.6px; }
+    .stat-bar-bg { height: 5px; border-radius: 99px; background: rgba(255,255,255,0.07); }
+    .stat-bar-fill {
+      border-radius: 99px;
+      background: linear-gradient(90deg, var(--accent), #7fb2ff);
+      box-shadow: 0 0 12px -3px rgba(79,141,251,0.9);
+    }
+    .section-title { letter-spacing: 1.1px; color: var(--text-muted); }
+    .info-value { letter-spacing: -0.2px; }
+
+    /* ── Tables ── */
+    th { background: rgba(255,255,255,0.025); border-bottom: 1px solid var(--border); }
+    tbody tr { transition: background 0.12s var(--ease); }
+    .table-panel tbody tr:hover { background: rgba(79,141,251,0.055); }
+
+    /* ── Switch status: a real banner, with an escape hatch when it wedges ── */
+    .switch-status-bar { display: flex; align-items: center; gap: 10px; }
+    .switch-status-bar.switch-active {
+      background: linear-gradient(90deg, rgba(245,165,36,0.13), rgba(245,165,36,0.03));
+      border: 1px solid rgba(245,165,36,0.3);
+      border-radius: 11px;
+      padding: 10px 14px;
+      color: var(--text);
+    }
+    .switch-status-bar.switch-stuck {
+      background: linear-gradient(90deg, rgba(242,85,90,0.13), rgba(242,85,90,0.03));
+      border-color: rgba(242,85,90,0.36);
+    }
+    .switch-spin {
+      width: 13px; height: 13px; flex-shrink: 0; border-radius: 50%;
+      border: 2px solid rgba(245,165,36,0.28); border-top-color: var(--warning);
+      animation: spin 0.7s linear infinite;
+    }
+    .switch-stuck .switch-spin { border-color: rgba(242,85,90,0.28); border-top-color: var(--danger); }
+    .switch-msg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .switch-elapsed { color: var(--text-muted); flex-shrink: 0; }
+    .switch-clear {
+      flex-shrink: 0;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.16);
+      color: var(--text-dim);
+      font: inherit; font-size: 11px; font-weight: 700;
+      padding: 5px 11px; border-radius: 8px; cursor: pointer;
+      transition: background 0.15s var(--ease), color 0.15s var(--ease);
+    }
+    .switch-clear:hover { background: rgba(255,255,255,0.13); color: var(--text); }
+    .switch-stuck .switch-clear { border-color: rgba(242,85,90,0.5); color: #ffb3b6; }
+
+    /* ── Benchmark history ── */
+    .bench-history { max-height: 190px; gap: 6px; font-family: inherit; }
+    .bench-history-row {
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: rgba(255,255,255,0.022);
+      display: flex; flex-direction: column; gap: 5px;
+      transition: border-color 0.15s var(--ease), background 0.15s var(--ease);
+    }
+    .bench-history-row:hover { border-color: rgba(255,255,255,0.14); background: rgba(255,255,255,0.045); }
+    .bench-history-row.bh-fail { border-color: rgba(242,85,90,0.3); background: rgba(242,85,90,0.05); }
+    .bh-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .bh-profile {
+      font-size: 8.5px; font-weight: 800; letter-spacing: 0.6px;
+      padding: 2px 5px; border-radius: 4px; flex-shrink: 0;
+      background: rgba(79,141,251,0.16); color: #8fb8ff; border: 1px solid rgba(79,141,251,0.28);
+    }
+    .bh-profile-full { background: rgba(33,201,138,0.16); color: #6fe3b6; border-color: rgba(33,201,138,0.3); }
+    .bh-model {
+      font-size: 11px; font-weight: 600; color: var(--text);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+    }
+    .bh-when { font-size: 9.5px; color: var(--text-muted); font-family: var(--font-mono); }
+    .bh-metrics { display: flex; flex-wrap: wrap; gap: 4px; }
+    .bh-metric {
+      font-size: 10px; font-family: var(--font-mono); color: var(--text-dim);
+      background: rgba(255,255,255,0.045); border-radius: 5px; padding: 2px 6px;
+    }
+    .bh-metric b { color: var(--text-muted); font-weight: 700; }
+    .bh-error { font-size: 10px; color: #ffa9ac; font-family: var(--font-mono); word-break: break-word; white-space: normal; }
+
+    /* ── Activity panel ── */
+    .activity-tab { transition: color 0.15s var(--ease), border-color 0.15s var(--ease); }
+    .activity-tab.active { border-bottom-width: 2px; }
+    .tab-chip { border-radius: 999px; }
+    .reqlog-input, .reqlog-refresh { border-radius: 9px; }
+    .reqlog-table thead th { background: #0c1220; }
+    .reqlog-ep, .status-pill { border-radius: 999px; padding: 2px 8px; }
+
+    /* ── Modal ── */
+    .modal-overlay { background: rgba(3,5,10,0.78); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+    .modal {
+      background: linear-gradient(168deg, var(--card-hi), var(--card));
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 18px;
+      box-shadow: var(--shadow-lg);
+      transform: scale(0.97);
+      transition: transform 0.2s var(--ease);
+    }
+    .modal-overlay.active .modal { transform: scale(1); }
+    .btn { border-radius: 10px; transition: filter 0.15s var(--ease), transform 0.12s var(--ease); }
+    .btn:hover { filter: brightness(1.12); transform: translateY(-1px); }
+    .btn:active { transform: translateY(0); }
+
+    @media (max-width: 600px) {
+      .switch-status-bar.switch-active { flex-wrap: wrap; }
+      .switch-msg { flex-basis: 100%; white-space: normal; }
+      .stat-value { font-size: 21px; }
+    }
+
+    /* ══════════════════════════════════════════════════════════════════════
+       Density + flair pass
+       ══════════════════════════════════════════════════════════════════════ */
+
+    /* Reclaim the outer margins; the panels already separate themselves. */
+    .main-content { padding: 12px 16px 14px; gap: 10px; }
+    .stats-row { gap: 10px; }
+
+    /* An idle status bar was costing ~46px of the log's height for an empty line. */
+    .switch-status-bar:empty { display: none; }
+
+    /* The right column used to be one tall card, which forced a dead gap beside
+       the short process table. Two cards + a stretched left column closes it. */
+    /* True 2×2 grid: both columns share the same row boundaries, so the seam
+       between the top chart and the Power/Thermals + Processes band always
+       lines up with the seam between Service Details and Benchmark, whatever
+       the panels' content heights are. */
+    .content-grid {
+      grid-template-columns: minmax(0, 1fr) 348px;
+      grid-template-rows: auto minmax(214px, auto);
+      grid-template-areas: "chart details" "lower bench";
+      gap: 10px; align-items: stretch;
+    }
+    .content-grid > .chart-panel { grid-area: chart; }
+    .content-grid > .info-panel:not(.bench-panel) { grid-area: details; }
+    .content-grid > .lower-row { grid-area: lower; }
+    .content-grid > .bench-panel { grid-area: bench; }
+    .info-panel { padding: 13px 15px; gap: 9px; }
+    .bench-panel { min-height: 0; }
+    /* The process list is almost always a single llama-server row, so it gets a
+       half-width slot and the reclaimed space goes to a second chart beside it. */
+    /* min-height, not height: the panel stretches when Service Details is the
+       taller cell in row one (it was 258px in a flex column, which is what
+       made the right-hand seam drift). */
+    .chart-panel {
+      height: auto; min-height: 258px; padding: 13px 15px 10px;
+      display: flex; flex-direction: column;
+    }
+    .chart-canvas-wrap { flex: 1; min-height: 0; position: relative; }
+
+    /* ── Chart header + range picker ── */
+    .chart-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; flex-wrap: wrap; margin-bottom: 12px;
+    }
+    .range-picker {
+      display: inline-flex; gap: 2px; padding: 2px;
+      background: rgba(255,255,255,0.045);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 9px;
+    }
+    .range-btn {
+      background: none; border: none; color: var(--text-muted);
+      font: inherit; font-size: 11px; font-weight: 700; letter-spacing: 0.3px;
+      padding: 4px 9px; border-radius: 7px; cursor: pointer;
+      transition: background 0.15s var(--ease), color 0.15s var(--ease);
+    }
+    .range-btn:hover { color: var(--text-dim); background: rgba(255,255,255,0.05); }
+    .range-btn.active {
+      background: linear-gradient(180deg, rgba(79,141,251,0.28), rgba(79,141,251,0.16));
+      color: #cfe0ff;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.12);
+    }
+    /* A class rule with display:flex outranks the UA's [hidden]{display:none}, so
+       without this the overlay never actually hides and dims the chart permanently. */
+    .chart-note[hidden] { display: none; }
+    .chart-note {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      text-align: center; padding: 16px;
+      font-size: 12px; color: var(--text-muted);
+      background: rgba(10,14,24,0.72);
+      border-radius: 10px;
+      pointer-events: none;
+    }
+    .lower-row {
+      display: grid;
+      grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+      gap: 10px;
+      min-height: 214px;
+    }
+    .chart-panel-sm { height: auto; }
+    .table-panel {
+      flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0;
+      container-type: inline-size;
+    }
+    .table-scroll { overflow: auto; flex: 1; min-height: 0; }
+    /* Seven columns in a narrowed panel: trim padding and never wrap a cell. */
+    .table-panel th, .table-panel td { padding: 8px 12px; white-space: nowrap; }
+    .table-panel th { font-size: 9.5px; letter-spacing: 0.4px; }
+    .table-panel td { font-size: 11.5px; }
+    /* Below the width where all seven fit, drop the two least-load-bearing columns
+       rather than introduce a horizontal scrollbar. */
+    @container (max-width: 540px) {
+      .table-panel th:nth-child(4), .table-panel td:nth-child(4),
+      .table-panel th:nth-child(5), .table-panel td:nth-child(5) { display: none; }
+    }
+    @container (max-width: 420px) {
+      .table-panel th:nth-child(6), .table-panel td:nth-child(6) { display: none; }
+    }
+    .table-header { padding: 13px 16px 9px; }
+
+    /* ── Stat cards: per-metric identity ── */
+    .stat-card { padding: 10px 13px 11px; }
+    .stat-card::after { background: linear-gradient(90deg, transparent, var(--sc), transparent); opacity: 0.65; }
+    .stat-card { --sc: rgba(255,255,255,0.16); }
+    .sc-gen    { --sc: #4f8dfb; }
+    .sc-ingest { --sc: #21c98a; }
+    .sc-ctx    { --sc: #a877f7; }
+    .sc-util   { --sc: #f5a524; }
+    .sc-vram   { --sc: #2ed3c6; }
+    .sc-temp   { --sc: #f2555a; }
+    /* A faint wash in the card's own colour, strongest at the lit top edge. */
+    .stat-card {
+      background:
+        radial-gradient(120% 90% at 50% -25%, color-mix(in srgb, var(--sc) 16%, transparent), transparent 70%),
+        linear-gradient(168deg, var(--card-hi), var(--card));
+    }
+    .stat-card:hover { border-color: color-mix(in srgb, var(--sc) 40%, transparent); }
+    .stat-value {
+      font-size: 23px;
+      background: linear-gradient(180deg, #ffffff, color-mix(in srgb, var(--sc) 55%, #ffffff));
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent; color: transparent;
+    }
+    .stat-sub { font-size: 10.5px; margin-top: 1px; }
+    .stat-bar-bg { margin-top: 7px; }
+    .stat-bar-fill {
+      background: linear-gradient(90deg, color-mix(in srgb, var(--sc) 55%, transparent), var(--sc));
+      box-shadow: 0 0 12px -3px var(--sc);
+    }
+
+    /* Sparkline fills the otherwise-empty lower half of the two speed cards. */
+    .stat-spark { margin-top: 6px; height: 22px; }
+    .stat-spark svg { display: block; width: 100%; height: 22px; overflow: visible; }
+    .stat-spark .spark-area { fill: var(--sc); opacity: 0.16; }
+    .stat-spark .spark-line { fill: none; stroke: var(--sc); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
+    .stat-spark .spark-dot { fill: var(--sc); }
+    .stat-spark .spark-empty { fill: none; stroke: rgba(255,255,255,0.1); stroke-width: 1.4; stroke-dasharray: 3 4; }
+
+    /* ── Header flair ── */
+    .app-header { position: relative; }
+    /* Slow drifting light along the header seam — the one moving thing when idle. */
+    .app-header::after {
+      content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
+      background: linear-gradient(90deg, transparent, var(--accent), #21c98a, transparent);
+      background-size: 42% 100%; background-repeat: no-repeat;
+      animation: header-sweep 9s ease-in-out infinite;
+      opacity: 0.75;
+    }
+    @keyframes header-sweep {
+      0%   { background-position: -45% 0; }
+      50%  { background-position: 145% 0; }
+      100% { background-position: -45% 0; }
+    }
+    .header-center { font-size: 12.5px; gap: 8px; }
+    .dot-success { animation: pulse-ring 2.4s ease-out infinite; }
+    @keyframes pulse-ring {
+      0%   { box-shadow: 0 0 0 0 rgba(33,201,138,0.45), 0 0 10px var(--success); }
+      70%  { box-shadow: 0 0 0 7px rgba(33,201,138,0), 0 0 10px var(--success); }
+      100% { box-shadow: 0 0 0 0 rgba(33,201,138,0), 0 0 10px var(--success); }
+    }
+
+    /* ── Benchmark card ── */
+    .bench-btn-row { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .bench-headline {
+      display: flex; align-items: center; gap: 12px;
+      padding: 9px 12px;
+      border-radius: 11px;
+      background: linear-gradient(140deg, rgba(79,141,251,0.10), rgba(33,201,138,0.07));
+      border: 1px solid rgba(255,255,255,0.07);
+    }
+    .bench-hl-item { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+    .bench-hl-sep { width: 1px; align-self: stretch; background: rgba(255,255,255,0.1); }
+    .bench-hl-value {
+      font-family: var(--font-mono); font-size: 16px; font-weight: 700;
+      letter-spacing: -0.5px; color: #9cc0ff; white-space: nowrap;
+    }
+    .bench-hl-gen { color: #6fe3b6; }
+    /* History scrolls inside the benchmark card so the card cannot push the log down. */
+    .bench-panel { min-height: 0; }
+    .bench-panel > .info-item:last-child { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 3px; }
+    .bench-history { max-height: none; flex: 1; min-height: 84px; }
+
+    /* ── Sidebar polish ── */
+    .sidebar-nav { padding: 9px 9px 7px; }
+    .model-row { padding: 8px 12px; }
+    .model-name { font-size: 12.5px; }
+
+    /* Measured speeds on the model card */
+    .model-bench { display: flex; gap: 4px; margin-top: 5px; }
+    .mb-pill {
+      display: inline-flex; align-items: baseline; gap: 3px;
+      font-family: var(--font-mono); font-size: 9.5px; font-weight: 700;
+      padding: 1.5px 5px; border-radius: 5px;
+      background: rgba(255,255,255,0.045);
+      border: 1px solid rgba(255,255,255,0.07);
+      font-variant-numeric: tabular-nums;
+    }
+    .mb-gen { color: #6fe3b6; border-color: rgba(33,201,138,0.24); background: rgba(33,201,138,0.09); }
+    .mb-pre { color: #8fb8ff; border-color: rgba(79,141,251,0.24); background: rgba(79,141,251,0.09); }
+    .mb-unit { font-size: 8px; font-weight: 600; opacity: 0.6; letter-spacing: 0.2px; }
+
+    /* ── Fill the viewport: the request log takes whatever height is left ──
+       Guarded on a tall-enough desktop window; below that the page keeps its normal
+       scrolling behaviour rather than squeezing every panel into a sliver. */
+    @media (min-width: 1201px) and (min-height: 760px) {
+      .main-content { overflow: hidden; }
+      .content-grid { flex: 0 0 auto; }
+      /* Scoped to the top chart: .chart-panel-sm shares the .chart-panel class and
+         must stay auto-height so it fills its grid row. */
+      .content-grid > .chart-panel { height: auto; min-height: 248px; }
+      .chart-panel-sm { height: auto; }
+      /* The grid stretches to the taller column, so the side column's natural height
+         sets how much is left for the log. The history list scrolls either way, so
+         capping it trades list height the user rarely needs for log height they do. */
+      .bench-history { max-height: 76px; }
+      .info-panel { gap: 7px; padding: 12px 15px; }
+      .activity-panel {
+        flex: 1 1 auto;
+        min-height: 220px;
+        margin-top: 0;
+        overflow: hidden;
+      }
+      .activity-body { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+      .activity-body[hidden] { display: none; }
+      .reqlog-scroll { max-height: none; flex: 1; min-height: 0; }
+      .events-body { max-height: none; flex: 1; min-height: 0; }
+    }
+
+    /* ── Wide screens: the six stat cards get roomy, so let content breathe ── */
+    @media (min-width: 1700px) {
+      .content-grid { grid-template-columns: minmax(0, 1fr) 380px; }
+      .main-content { padding: 16px 22px 20px; }
+    }
+    /* These must restate grid-template-columns: this block sits after the base
+       responsive rules, so an unqualified two-column value here would win at every width. */
+    @media (max-width: 1200px) {
+      .content-grid {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: none;
+        grid-template-areas: "chart" "lower" "details" "bench";
+      }
+      .chart-panel { height: 300px; }
+      .chart-panel-sm { height: 260px; }
+    }
+    @media (max-width: 980px) {
+      .lower-row { grid-template-columns: minmax(0, 1fr); }
+    }
+    @media (max-width: 760px) {
+      .chart-panel { height: 260px; }
+      .chart-panel-sm { height: 240px; }
+      .table-panel { max-height: none; }
+    }
+
+    /* ── Settings modal ── */
+    .settings-modal { max-width: 760px; width: 94vw; max-height: 88vh; padding: 0; text-align: left; display: flex; flex-direction: column; }
+    .settings-foot {
+      display: flex; align-items: center; gap: 10px;
+      padding: 14px 22px; border-top: 1px solid var(--border); flex-shrink: 0;
+    }
+    .settings-status { flex: 1; font-size: 12px; color: var(--text-muted); min-width: 0; }
+    .settings-status.ok { color: var(--success); }
+    .settings-status.err { color: var(--danger); }
+    .settings-foot .btn { font-size: 12.5px; padding: 8px 18px; }
+    .set-intro {
+      font-size: 12px; color: var(--text-dim); line-height: 1.6;
+      background: rgba(79,141,251,0.07); border: 1px solid rgba(79,141,251,0.18);
+      border-radius: 10px; padding: 11px 13px; margin-bottom: 16px;
+    }
+    .set-intro code { font-family: var(--font-mono); font-size: 11px; color: var(--text); }
+    .set-group { margin-bottom: 8px; }
+    .set-section {
+      font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.9px;
+      color: var(--text-muted); margin: 18px 0 10px;
+    }
+    .set-section:first-child { margin-top: 0; }
+    .set-row {
+      border: 1px solid var(--border); border-radius: 11px;
+      padding: 12px 13px; margin-bottom: 10px;
+      background: rgba(255,255,255,0.018);
+    }
+    .set-row-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 3px; }
+    .set-label { font-size: 12.5px; font-weight: 700; color: var(--text); }
+    .set-src {
+      font-size: 8.5px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase;
+      padding: 2px 6px; border-radius: 4px;
+      background: rgba(255,255,255,0.06); color: var(--text-muted); border: 1px solid rgba(255,255,255,0.1);
+    }
+    .set-src-settings { background: rgba(79,141,251,0.16); color: #8fb8ff; border-color: rgba(79,141,251,0.3); }
+    .set-src-env      { background: rgba(245,165,36,0.15); color: #f5c579; border-color: rgba(245,165,36,0.3); }
+    .set-help { font-size: 11px; color: var(--text-muted); line-height: 1.5; margin-bottom: 8px; }
+    .set-input {
+      width: 100%; padding: 8px 11px; border-radius: 9px;
+      background: var(--bg); border: 1px solid var(--border-strong);
+      color: var(--text); font-family: var(--font-mono); font-size: 11.5px; outline: none;
+      transition: border-color 0.15s var(--ease);
+    }
+    .set-input:focus { border-color: var(--accent); background: rgba(79,141,251,0.06); }
+    .set-check { display: flex; align-items: center; gap: 7px; margin-top: 7px; font-size: 11px; font-family: var(--font-mono); }
+    .set-check-ok   { color: #6fe3b6; }
+    .set-check-warn { color: #f5c579; }
+    .set-check-bad  { color: #ffa9ac; }
+    .set-check-idle { color: var(--text-muted); }
+    .set-envnote { font-size: 10.5px; color: var(--text-muted); margin-top: 6px; font-family: var(--font-mono); word-break: break-all; }
+
+    /* Respect the OS setting — every transition above is decorative. */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
   </style>
 </head>
 <body>
@@ -3277,6 +4544,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="nav-link" onclick="goTo('overview')"><span class="nav-ico">&#128202;</span> Overview</button>
         <button class="nav-link" onclick="goTo('requests')"><span class="nav-ico">&#128220;</span> Request Log</button>
         <button class="nav-link" onclick="goTo('events')"><span class="nav-ico">&#128276;</span> Events</button>
+        <button class="nav-link" onclick="openSettings()"><span class="nav-ico">&#9881;</span> Settings</button>
       </nav>
       <div class="sidebar-search-wrap">
         <input type="search" class="sidebar-search" id="sidebarSearch" placeholder="Search models..." oninput="filterSidebar()" />
@@ -3295,35 +4563,41 @@ INDEX_HTML = r"""<!doctype html>
 
       <!-- Quick stats -->
       <div class="stats-row">
-        <div class="stat-card">
+        <div class="stat-card sc-gen">
           <div class="stat-label">Generation Speed</div>
           <div class="stat-value" id="val-tps">--</div>
           <div class="stat-sub">tokens / sec</div>
+          <div class="stat-spark" id="spark-tps"></div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card sc-ingest">
           <div class="stat-label">Ingest Speed</div>
           <div class="stat-value" id="val-ingest">--</div>
           <div class="stat-sub">tokens / sec</div>
+          <div class="stat-spark" id="spark-ingest"></div>
         </div>
-        <div class="stat-card" id="stat-ctx-card">
+        <div class="stat-card sc-ctx" id="stat-ctx-card">
           <div class="stat-label" id="stat-ctx-label">Context</div>
           <div class="stat-value" id="val-ctx">-- / --</div>
+          <div class="stat-sub" id="val-ctx-sub">window used</div>
           <div class="stat-bar-bg"><div id="bar-ctx" class="stat-bar-fill" style="width:0%"></div></div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card sc-util">
           <div class="stat-label">GPU Utilization</div>
           <div class="stat-value" id="val-util">--%</div>
+          <div class="stat-sub" id="val-util-sub">compute load</div>
           <div class="stat-bar-bg"><div id="bar-util" class="stat-bar-fill" style="width:0%"></div></div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card sc-vram">
           <div class="stat-label">VRAM Usage</div>
           <div class="stat-value" id="val-vram">-- GB</div>
+          <div class="stat-sub" id="val-vram-sub">of -- GB</div>
           <div class="stat-bar-bg"><div id="bar-vram" class="stat-bar-fill" style="width:0%"></div></div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card sc-temp">
           <div class="stat-label">Temperature</div>
           <div class="stat-value" id="val-temp">--&deg;C</div>
           <div class="stat-sub" id="val-fan">Fan: --%</div>
+          <div class="stat-bar-bg"><div id="bar-temp" class="stat-bar-fill" style="width:0%"></div></div>
         </div>
       </div>
 
@@ -3332,79 +4606,96 @@ INDEX_HTML = r"""<!doctype html>
 
       <!-- Chart + Info -->
       <div class="content-grid">
-        <div class="main-column">
           <div class="chart-panel">
-            <div class="section-title">Hardware Performance History (60s)</div>
-            <div style="height: 230px;"><canvas id="historyChart"></canvas></div>
+            <div class="chart-head">
+              <div class="section-title" style="margin:0" id="perfChartTitle">Hardware Performance History</div>
+              <div class="range-picker" id="rangePicker" role="group" aria-label="Chart time range"></div>
+            </div>
+            <div class="chart-canvas-wrap">
+              <canvas id="historyChart"></canvas>
+              <div class="chart-note" id="chartNote" hidden></div>
+            </div>
           </div>
 
-          <!-- GPU Processes -->
-          <div class="table-panel">
-            <div class="table-header"><div class="section-title" style="margin:0">Active GPU Processes</div></div>
-            <table>
-              <thead><tr><th>PID</th><th>Application</th><th>VRAM</th><th>CPU%</th><th>RAM</th><th>GPU%</th><th>Status</th></tr></thead>
-              <tbody id="procTable">
-                <tr><td colspan="7" style="text-align:center; color:var(--text-muted)">Scanning processes...</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-        <div class="info-panel">
-          <div class="section-title">Service Details</div>
-          <div class="info-item">
-            <div class="info-label">Active Model</div>
-            <div class="info-value" id="info-model" style="color: var(--success); font-size: 12px; line-height: 1.4">NONE</div>
-          </div>
-          <div class="info-item">
-            <div class="info-badges" id="info-badges"></div>
-          </div>
-          <div class="info-pair">
-            <div class="info-item">
-              <div class="info-label">Avg Rate</div>
-              <div class="info-value" id="info-avg-rate">-- T/S</div>
+          <!-- Power/thermals chart + GPU processes share the lower band -->
+          <div class="lower-row">
+            <div class="chart-panel chart-panel-sm">
+              <div class="section-title" id="thermalChartTitle">Power &amp; Thermals</div>
+              <div class="chart-canvas-wrap"><canvas id="thermalChart"></canvas></div>
             </div>
-            <div class="info-item">
-              <div class="info-label">Completed Runs</div>
-              <div class="info-value" id="info-runs">0</div>
+
+            <div class="table-panel">
+              <div class="table-header"><div class="section-title" style="margin:0">Active GPU Processes</div></div>
+              <div class="table-scroll">
+                <table>
+                  <thead><tr><th>PID</th><th>Application</th><th>VRAM</th><th>CPU%</th><th>RAM</th><th>GPU%</th><th>Status</th></tr></thead>
+                  <tbody id="procTable">
+                    <tr><td colspan="7" style="text-align:center; color:var(--text-muted)">Scanning processes...</td></tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
-          <div class="info-pair">
+
+          <div class="info-panel">
+            <div class="section-title">Service Details</div>
             <div class="info-item">
-              <div class="info-label">Clocks (GFX/MEM)</div>
-              <div class="info-value" id="info-clocks" style="font-size:11px">-- / -- MHz</div>
+              <div class="info-label">Active Model</div>
+              <div class="info-value" id="info-model" style="color: var(--success); font-size: 12px; line-height: 1.4">NONE</div>
             </div>
             <div class="info-item">
-              <div class="info-label">Power Draw</div>
-              <div class="info-value" id="info-power">--W / --W</div>
+              <div class="info-badges" id="info-badges"></div>
+            </div>
+            <div class="info-pair">
+              <div class="info-item">
+                <div class="info-label">Avg Rate</div>
+                <div class="info-value" id="info-avg-rate">-- T/S</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Completed Runs</div>
+                <div class="info-value" id="info-runs">0</div>
+              </div>
+            </div>
+            <div class="info-pair">
+              <div class="info-item">
+                <div class="info-label">Clocks (GFX/MEM)</div>
+                <div class="info-value" id="info-clocks" style="font-size:11px">-- / -- MHz</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Power Draw</div>
+                <div class="info-value" id="info-power">--W / --W</div>
+              </div>
             </div>
           </div>
-          <div class="info-item">
+
+          <div class="info-panel bench-panel">
+            <div class="section-title">Benchmark</div>
             <div class="bench-btn-row">
-              <button class="btn-benchmark" id="btnBenchmark" onclick="triggerBenchmark('balanced')">RUN BENCHMARK</button>
-              <button class="btn-benchmark-full" id="btnBenchmarkFull" onclick="triggerBenchmark('full')">RUN FULL BENCHMARK</button>
+              <button class="btn-benchmark" id="btnBenchmark" onclick="triggerBenchmark('balanced')">QUICK</button>
+              <button class="btn-benchmark-full" id="btnBenchmarkFull" onclick="triggerBenchmark('full')">FULL</button>
             </div>
-          </div>
-          <div class="info-pair">
+            <div class="bench-headline">
+              <div class="bench-hl-item">
+                <div class="info-label">Prefill</div>
+                <div class="bench-hl-value" id="info-bench-prefill">-- T/S</div>
+              </div>
+              <div class="bench-hl-sep"></div>
+              <div class="bench-hl-item">
+                <div class="info-label">Generation</div>
+                <div class="bench-hl-value bench-hl-gen" id="info-bench-gen">-- T/S</div>
+              </div>
+            </div>
             <div class="info-item">
-              <div class="info-label">Bench Prefill</div>
-              <div class="info-value" id="info-bench-prefill">-- T/S</div>
+              <div class="info-label">Last Run</div>
+              <div class="info-value" id="info-bench-last" style="font-size:11px; line-height:1.45">--</div>
             </div>
             <div class="info-item">
-              <div class="info-label">Bench Gen</div>
-              <div class="info-value" id="info-bench-gen">-- T/S</div>
+              <div class="info-label">History (Last 10)</div>
+              <div class="bench-history" id="info-bench-history">
+                <div class="bench-history-empty">No benchmark runs yet.</div>
+              </div>
             </div>
           </div>
-          <div class="info-item">
-            <div class="info-label">Last Run</div>
-            <div class="info-value" id="info-bench-last" style="font-size:11px">--</div>
-          </div>
-          <div class="info-item">
-            <div class="info-label">Benchmark History (Last 10)</div>
-            <div class="bench-history" id="info-bench-history">
-              <div class="bench-history-empty">No benchmark runs yet.</div>
-            </div>
-          </div>
-        </div>
       </div>
 
       <!-- Activity: Request Log + Events -->
@@ -3468,6 +4759,22 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <!-- Settings modal -->
+  <div id="settingsModal" class="modal-overlay" onclick="if(event.target===this)closeSettings()">
+    <div class="modal settings-modal">
+      <div class="reqdetail-head">
+        <h2>Settings</h2>
+        <button class="reqdetail-close" onclick="closeSettings()" title="Close">&#10005;</button>
+      </div>
+      <div class="reqdetail-body" id="settingsBody">Loading…</div>
+      <div class="settings-foot">
+        <span class="settings-status" id="settingsStatus"></span>
+        <button class="btn btn-cancel" onclick="closeSettings()">CLOSE</button>
+        <button class="btn btn-confirm" id="btnSaveSettings" onclick="saveSettings()">SAVE</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Request detail modal -->
   <div id="reqDetailModal" class="modal-overlay" onclick="if(event.target===this)closeRequestDetail()">
     <div class="modal reqdetail-modal">
@@ -3481,6 +4788,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <script>
     let chart = null;
+    let thermalChart = null;
     let isRefreshing = false;
     let pendingAction = null;
     let lastUpdated = Date.now();
@@ -3488,7 +4796,165 @@ INDEX_HTML = r"""<!doctype html>
     let eventsPanelOpen = true;
     let eventsLastCount = 0;
     let searchQuery = '';
-    const history = { util: Array(60).fill(0), vram: Array(60).fill(0), tps: Array(60).fill(0) };
+    const history = {
+      util: Array(60).fill(0), vram: Array(60).fill(0),
+      tps: Array(60).fill(0), ingest: Array(60).fill(0),
+      power: Array(60).fill(0), temp: Array(60).fill(0), fan: Array(60).fill(0)
+    };
+
+    // ── Chart time range ──────────────────────────────────────────────────────
+    // '1m' is the live in-page buffer (sub-second resolution, no server round trip).
+    // Everything longer is served from the sampler's SQLite store.
+    const RANGE_OPTIONS = [
+      { key: '1m',  label: '1m',  live: true },
+      { key: '5m',  label: '5m'  },
+      { key: '15m', label: '15m' },
+      { key: '1h',  label: '1h'  },
+      { key: '24h', label: '24h' },
+      { key: '7d',  label: '7d'  },
+      { key: '30d', label: '1mo' }
+    ];
+    const RANGE_LABELS = { '1m': '60s', '5m': '5 min', '15m': '15 min', '1h': '1 hour',
+                           '24h': '24 hours', '7d': '7 days', '30d': '30 days' };
+    let chartRange = localStorage.getItem('chartRange') || '1m';
+    if (!RANGE_OPTIONS.some(o => o.key === chartRange)) chartRange = '1m';
+    let historyPoints = null;      // last fetched historical payload
+    let historyFetching = false;
+    let historyTimer = null;
+
+    function isLiveRange() { return chartRange === '1m'; }
+
+    function buildRangePicker() {
+      const el = document.getElementById('rangePicker');
+      el.innerHTML = RANGE_OPTIONS.map(o =>
+        `<button class="range-btn${o.key === chartRange ? ' active' : ''}" data-range="${o.key}"
+           onclick="setChartRange('${o.key}')">${o.label}</button>`).join('');
+      document.getElementById('perfChartTitle').textContent =
+        `Hardware Performance History (${RANGE_LABELS[chartRange]})`;
+      const t = document.getElementById('thermalChartTitle');
+      if (t) t.textContent = `Power & Thermals (${RANGE_LABELS[chartRange]})`;
+    }
+
+    function setChartRange(key) {
+      if (!RANGE_OPTIONS.some(o => o.key === key)) return;
+      chartRange = key;
+      try { localStorage.setItem('chartRange', key); } catch (e) {}
+      historyPoints = null;
+      buildRangePicker();
+      if (historyTimer) { clearInterval(historyTimer); historyTimer = null; }
+      if (isLiveRange()) {
+        setChartNote(null);
+        applyLiveSeries();
+      } else {
+        setChartNote('Loading history…');
+        fetchHistory();
+        // Buckets are minutes-to-hours wide past 1h; polling faster just burns queries.
+        const period = (key === '5m' || key === '15m') ? 15000 : 60000;
+        historyTimer = setInterval(fetchHistory, period);
+      }
+    }
+
+    function setChartNote(msg) {
+      const el = document.getElementById('chartNote');
+      if (!el) return;
+      if (!msg) { el.hidden = true; el.textContent = ''; return; }
+      el.hidden = false;
+      el.textContent = msg;
+    }
+
+    async function fetchHistory() {
+      if (historyFetching || isLiveRange()) return;
+      historyFetching = true;
+      const requested = chartRange;
+      try {
+        const r = await fetch(`/api/metrics/history?range=${encodeURIComponent(requested)}`);
+        const d = await r.json();
+        // The user may have clicked another range while this was in flight.
+        if (requested !== chartRange) return;
+        if (d.error) { setChartNote(d.error); return; }
+        if (!d.points || !d.points.length) {
+          setChartNote('No samples recorded for this range yet.');
+          historyPoints = null;
+          return;
+        }
+        historyPoints = d;
+        setChartNote(null);
+        applyHistorySeries(d);
+      } catch (e) {
+        if (requested === chartRange) setChartNote(`History unavailable: ${e}`);
+      } finally {
+        historyFetching = false;
+      }
+    }
+
+    function fmtBucketLabel(tSec, span) {
+      const d = new Date(tSec * 1000);
+      if (span <= 3600) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      if (span <= 86400) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+             d.toLocaleTimeString([], { hour: '2-digit' });
+    }
+
+    function applyHistorySeries(d) {
+      const labels = d.points.map(p => fmtBucketLabel(p.t, d.span_sec));
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = d.points.map(p => p.util);
+      chart.data.datasets[1].data = d.points.map(p => p.vram_pct);
+      // Averaging generation speed across a multi-minute bucket that is mostly idle
+      // reads as ~0. The bucket peak is the honest answer to "how fast did it run".
+      chart.data.datasets[2].data = d.points.map(p => p.tps_max);
+      chart.data.datasets[2].label = 'Gen Speed (peak T/S)';
+      chart.options.scales.x.display = true;
+      chart.update();
+
+      if (thermalChart) {
+        thermalChart.data.labels = labels;
+        thermalChart.data.datasets[0].data = d.points.map(p => p.power);
+        thermalChart.data.datasets[1].data = d.points.map(p => p.temp);
+        thermalChart.data.datasets[2].data = d.points.map(p => p.fan);
+        thermalChart.options.scales.x.display = true;
+        thermalChart.update();
+      }
+    }
+
+    function applyLiveSeries() {
+      chart.data.labels = Array(60).fill('');
+      chart.data.datasets[0].data = history.util;
+      chart.data.datasets[1].data = history.vram;
+      chart.data.datasets[2].data = history.tps;
+      chart.data.datasets[2].label = 'Gen Speed (T/S)';
+      chart.options.scales.x.display = false;
+      chart.update();
+
+      if (thermalChart) {
+        thermalChart.data.labels = Array(60).fill('');
+        thermalChart.data.datasets[0].data = history.power;
+        thermalChart.data.datasets[1].data = history.temp;
+        thermalChart.data.datasets[2].data = history.fan;
+        thermalChart.options.scales.x.display = false;
+        thermalChart.update();
+      }
+    }
+
+    // Inline SVG sparkline. Cheap enough to redraw on every 2s poll and it fills the
+    // dead lower half of the two speed cards with something that actually says something.
+    function sparkline(values) {
+      const W = 100, H = 26;
+      const max = Math.max(...values);
+      if (!(max > 0)) {
+        return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+          <line class="spark-empty" x1="0" y1="${H - 1}" x2="${W}" y2="${H - 1}"/></svg>`;
+      }
+      const n = values.length;
+      const y = (v) => H - 1 - (v / max) * (H - 3);
+      const pts = values.map((v, i) => `${((i / (n - 1)) * W).toFixed(2)},${y(v).toFixed(2)}`);
+      const last = values[n - 1];
+      return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+        <polygon class="spark-area" points="0,${H} ${pts.join(' ')} ${W},${H}"/>
+        <polyline class="spark-line" points="${pts.join(' ')}" vector-effect="non-scaling-stroke"/>
+        ${last > 0 ? `<circle class="spark-dot" cx="${W - 0.8}" cy="${y(last).toFixed(2)}" r="1.8"/>` : ''}
+      </svg>`;
+    }
 
     // Family display order for sidebar grouping
     // NOTE: a model whose LLM_META family="..." is missing from FAMILY_ORDER is silently
@@ -3512,34 +4978,134 @@ INDEX_HTML = r"""<!doctype html>
 
     function initChart() {
       const ctx = document.getElementById('historyChart').getContext('2d');
+      // Vertical fades instead of flat fills — the three series stay readable where they overlap.
+      const fade = (hex) => {
+        const g = ctx.createLinearGradient(0, 0, 0, 230);
+        g.addColorStop(0, hex + '44');
+        g.addColorStop(1, hex + '00');
+        return g;
+      };
       chart = new Chart(ctx, {
         type: 'line',
         data: {
           labels: Array(60).fill(''),
           datasets: [
-            { label: 'GPU Util %', data: history.util, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.08)', fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
-            { label: 'VRAM %',     data: history.vram, borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.08)', fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
-            { label: 'Gen Speed (T/S)', data: history.tps, borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.08)', fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' }
+            { label: 'GPU Util %', data: history.util, borderColor: '#4f8dfb', backgroundColor: fade('#4f8dfb'), fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
+            { label: 'VRAM %',     data: history.vram, borderColor: '#21c98a', backgroundColor: fade('#21c98a'), fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
+            { label: 'Gen Speed (T/S)', data: history.tps, borderColor: '#f5a524', backgroundColor: fade('#f5a524'), fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' }
           ]
         },
         options: {
           responsive: true, maintainAspectRatio: false, animation: false,
+          interaction: { mode: 'index', intersect: false },
           scales: {
             y: {
               beginAtZero: true, max: 100,
-              grid: { color: 'rgba(255,255,255,0.04)' },
-              ticks: { color: '#6b7280', font: { size: 11 } }
+              border: { display: false },
+              grid: { color: 'rgba(255,255,255,0.045)' },
+              ticks: { color: '#7c8798', font: { size: 11 }, padding: 8 }
             },
             y1: {
               beginAtZero: true,
+              // Without a floor an idle GPU auto-scales the axis to 0–1, which reads as
+              // a broken chart. 20 T/S is a sane empty-state ceiling.
+              suggestedMax: 20,
               position: 'right',
+              border: { display: false },
               grid: { drawOnChartArea: false },
-              ticks: { color: '#f59e0b', font: { size: 11 } },
-              title: { display: true, text: 'Tokens/Sec', color: '#f59e0b' }
+              ticks: { color: '#f5a524', font: { size: 11 }, padding: 8 },
+              title: { display: true, text: 'Tokens/Sec', color: '#f5a524', font: { size: 10 } }
             },
-            x: { display: false }
+            x: {
+              display: false,
+              border: { display: false },
+              grid: { display: false },
+              ticks: {
+                color: '#7c8798', font: { size: 9.5 },
+                maxRotation: 0, autoSkip: true, maxTicksLimit: 7
+              }
+            }
           },
-          plugins: { legend: { labels: { color: '#9ca3af', boxWidth: 10, font: { size: 11 } } } }
+          plugins: {
+            legend: { labels: { color: '#a7b2c4', boxWidth: 8, boxHeight: 8, usePointStyle: true, pointStyle: 'circle', font: { size: 11 }, padding: 16 } },
+            tooltip: {
+              backgroundColor: 'rgba(14,19,32,0.96)',
+              borderColor: 'rgba(255,255,255,0.12)',
+              borderWidth: 1,
+              titleColor: '#f4f7fb',
+              bodyColor: '#a7b2c4',
+              padding: 10,
+              cornerRadius: 8,
+              displayColors: true,
+              usePointStyle: true
+            }
+          }
+        }
+      });
+    }
+
+    function initThermalChart() {
+      const el = document.getElementById('thermalChart');
+      if (!el) return;
+      const ctx = el.getContext('2d');
+      const fade = (hex) => {
+        const g = ctx.createLinearGradient(0, 0, 0, 200);
+        g.addColorStop(0, hex + '3a');
+        g.addColorStop(1, hex + '00');
+        return g;
+      };
+      thermalChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: Array(60).fill(''),
+          datasets: [
+            { label: 'Power (W)', data: history.power, borderColor: '#a877f7', backgroundColor: fade('#a877f7'), fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'yw' },
+            { label: 'Temp (°C)', data: history.temp,  borderColor: '#f2555a', backgroundColor: fade('#f2555a'), fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
+            { label: 'Fan (%)',   data: history.fan,   borderColor: '#2ed3c6', backgroundColor: 'transparent',   fill: false, tension: 0.4, pointRadius: 0, borderWidth: 1.6, borderDash: [4, 3], yAxisID: 'y' }
+          ]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: false,
+          interaction: { mode: 'index', intersect: false },
+          scales: {
+            // °C and % share the left axis — both are 0-100 scales and read together.
+            y: {
+              beginAtZero: true, max: 100,
+              border: { display: false },
+              grid: { color: 'rgba(255,255,255,0.045)' },
+              ticks: { color: '#7c8798', font: { size: 10 }, padding: 6, stepSize: 25 }
+            },
+            yw: {
+              beginAtZero: true, suggestedMax: 100,
+              position: 'right',
+              border: { display: false },
+              grid: { drawOnChartArea: false },
+              ticks: { color: '#c9a6ff', font: { size: 10 }, padding: 6 },
+              title: { display: true, text: 'Watts', color: '#c9a6ff', font: { size: 10 } }
+            },
+            x: {
+              display: false,
+              border: { display: false },
+              grid: { display: false },
+              ticks: {
+                color: '#7c8798', font: { size: 9.5 },
+                maxRotation: 0, autoSkip: true, maxTicksLimit: 7
+              }
+            }
+          },
+          plugins: {
+            legend: { labels: { color: '#a7b2c4', boxWidth: 8, boxHeight: 8, usePointStyle: true, pointStyle: 'circle', font: { size: 10.5 }, padding: 12 } },
+            tooltip: {
+              backgroundColor: 'rgba(14,19,32,0.96)',
+              borderColor: 'rgba(255,255,255,0.12)',
+              borderWidth: 1,
+              titleColor: '#f4f7fb',
+              bodyColor: '#a7b2c4',
+              padding: 10,
+              cornerRadius: 8,
+              usePointStyle: true
+            }
+          }
         }
       });
     }
@@ -3587,10 +5153,24 @@ INDEX_HTML = r"""<!doctype html>
           if (m.quant) tags += `<span class="tag-pill tag-quant">${escHtml(m.quant)}</span>`;
           if (m.thinking) tags += `<span class="tag-pill tag-cot">COT</span>`;
           if (m.vision) tags += `<span class="tag-pill tag-vision">VISION</span>`;
+          // Measured speeds from the last successful benchmark, persisted per model.
+          let benchRow = '';
+          if (m.bench && (m.bench.gen_tps || m.bench.prefill_tps)) {
+            const when = m.bench.ts ? new Date(m.bench.ts * 1000).toLocaleString() : 'unknown time';
+            const prof = (m.bench.profile || '').toUpperCase();
+            const t = `Last ${prof} benchmark — ${when}`;
+            const gen = m.bench.gen_tps ? Number(m.bench.gen_tps).toFixed(1) : '--';
+            const pre = m.bench.prefill_tps ? Math.round(m.bench.prefill_tps) : '--';
+            benchRow = `<div class="model-bench" title="${escHtml(t)}">
+              <span class="mb-pill mb-gen">▶ ${gen}<span class="mb-unit">gen</span></span>
+              <span class="mb-pill mb-pre">▼ ${pre}<span class="mb-unit">ingest</span></span>
+            </div>`;
+          }
           html += `<div class="${cls}" onclick="confirmSwitch('${m.key}','${escHtml(m.label)}')">
             <div class="model-row-inner">
               <div class="model-row-top">${spin}<span class="model-name">${escHtml(m.label)}</span></div>
               ${tags ? `<div class="model-tags">${tags}</div>` : ''}
+              ${benchRow}
             </div>
           </div>`;
         }
@@ -3690,11 +5270,25 @@ INDEX_HTML = r"""<!doctype html>
       document.getElementById('val-temp').textContent = gpu.temp != null ? `${gpu.temp}°C` : '--°C';
       document.getElementById('val-fan').textContent = `Fan: ${gpu.fan || 0}%`;
 
+      document.getElementById('val-util-sub').textContent =
+        gpu.util != null ? (gpu.util > 5 ? 'compute active' : 'idle') : 'compute load';
+      document.getElementById('val-vram-sub').textContent =
+        gpu.mem_total > 0 ? `of ${(gpu.mem_total / 1024).toFixed(1)} GB · ${vramPct.toFixed(0)}%` : 'of -- GB';
+      // Temperature bar spans a useful 30–95 °C, not 0–100, so normal running is visible movement.
+      const tempPct = gpu.temp != null ? Math.max(0, Math.min(100, ((gpu.temp - 30) / 65) * 100)) : 0;
+      document.getElementById('bar-temp').style.width = `${tempPct.toFixed(1)}%`;
+
       // Context card
       const nCtx = ctxInfo.n_ctx;
       const nPast = ctxInfo.n_past;
       const ctxEl = document.getElementById('val-ctx');
       const ctxBar = document.getElementById('bar-ctx');
+      const ctxSub = document.getElementById('val-ctx-sub');
+      if (nCtx != null) {
+        ctxSub.textContent = (nPast > 0) ? `${((nPast / nCtx) * 100).toFixed(1)}% of window` : 'window idle';
+      } else {
+        ctxSub.textContent = 'window used';
+      }
       if (nCtx != null) {
         const ctxMax = nCtx >= 1024 ? `${Math.round(nCtx/1024)}k` : `${nCtx}`;
         if (nPast != null && nPast > 0) {
@@ -3702,13 +5296,15 @@ INDEX_HTML = r"""<!doctype html>
           ctxEl.textContent = `${ctxUsed} / ${ctxMax}`;
           const pct = Math.min(100, (nPast / nCtx) * 100);
           ctxBar.style.width = `${pct.toFixed(1)}%`;
-          if (pct > 90) ctxBar.style.background = 'var(--danger)';
-          else if (pct > 70) ctxBar.style.background = 'var(--warning)';
-          else ctxBar.style.background = 'var(--accent)';
+          // Overriding --sc keeps the fill, its glow and the card accent in sync.
+          const ctxCard = document.getElementById('stat-ctx-card');
+          if (pct > 90) ctxCard.style.setProperty('--sc', '#f2555a');
+          else if (pct > 70) ctxCard.style.setProperty('--sc', '#f5a524');
+          else ctxCard.style.removeProperty('--sc');
         } else {
           ctxEl.textContent = `0 / ${ctxMax}`;
           ctxBar.style.width = '0%';
-          ctxBar.style.background = 'var(--accent)';
+          document.getElementById('stat-ctx-card').style.removeProperty('--sc');
         }
       } else {
         ctxEl.textContent = '-- / --';
@@ -3717,10 +5313,26 @@ INDEX_HTML = r"""<!doctype html>
 
       // History chart
       const tpsVal = stats.live_tps || 0;
+      const ingestLive = (live?.state !== 'idle' && liveIngest > 0) ? liveIngest : 0;
       history.util.push(gpu.util || 0); history.util.shift();
       history.vram.push(vramPct); history.vram.shift();
       history.tps.push(tpsVal); history.tps.shift();
-      chart.update();
+      history.ingest.push(ingestLive); history.ingest.shift();
+      history.power.push(gpu.power || 0); history.power.shift();
+      history.temp.push(gpu.temp || 0); history.temp.shift();
+      history.fan.push(gpu.fan || 0); history.fan.shift();
+      // Track the card's real ceiling so the watts axis isn't dwarfed by a 280W limit.
+      if (thermalChart && gpu.power_limit > 0) {
+        thermalChart.options.scales.yw.suggestedMax = gpu.power_limit;
+      }
+      // In a historical range the charts are driven by fetchHistory, not by this poll.
+      if (isLiveRange()) {
+        chart.update();
+        if (thermalChart) thermalChart.update();
+      }
+
+      document.getElementById('spark-tps').innerHTML = sparkline(history.tps);
+      document.getElementById('spark-ingest').innerHTML = sparkline(history.ingest);
 
       // Service details
       const infoModel = document.getElementById('info-model');
@@ -3764,11 +5376,11 @@ INDEX_HTML = r"""<!doctype html>
       const canRun = (!!data.active?.healthy) && !data.switch_in_progress && !bench.in_progress;
       if (btnBenchmark) {
         btnBenchmark.disabled = !canRun;
-        btnBenchmark.textContent = (bench.in_progress && bench.profile === 'balanced') ? 'BENCHMARKING...' : 'RUN BENCHMARK';
+        btnBenchmark.textContent = (bench.in_progress && bench.profile === 'balanced') ? 'RUNNING…' : 'QUICK';
       }
       if (btnBenchmarkFull) {
         btnBenchmarkFull.disabled = !canRun;
-        btnBenchmarkFull.textContent = (bench.in_progress && bench.profile === 'full') ? 'BENCHMARKING...' : 'RUN FULL BENCHMARK';
+        btnBenchmarkFull.textContent = (bench.in_progress && bench.profile === 'full') ? 'RUNNING…' : 'FULL';
       }
 
       const benchRes = bench.last_result || {};
@@ -3779,7 +5391,8 @@ INDEX_HTML = r"""<!doctype html>
       } else if (bench.last_error) {
         infoBenchLast.textContent = `Failed: ${bench.last_error}`;
       } else if (benchRes.completed_at) {
-        infoBenchLast.textContent = `${(benchRes.profile || 'balanced').toUpperCase()} at ${fmtLocalTs(benchRes.completed_at)}`;
+        const who = benchRes.model_label ? ` · ${benchRes.model_label}` : '';
+        infoBenchLast.textContent = `${(benchRes.profile || 'balanced').toUpperCase()}${who} at ${fmtLocalTs(benchRes.completed_at)}`;
       } else {
         infoBenchLast.textContent = '--';
       }
@@ -3792,12 +5405,28 @@ INDEX_HTML = r"""<!doctype html>
         historyEl.innerHTML = rows.map((r) => {
           const when = fmtLocalTs(r.completed_at || r.started_at);
           const profile = (r.profile || 'balanced').toUpperCase();
+          // Older entries predate model_label; fall back to the key so they still identify a model.
+          const model = r.model_label || r.model_key || 'unknown model';
+          const head = `<div class="bh-head">
+              <span class="bh-profile bh-profile-${profile.toLowerCase()}">${profile}</span>
+              <span class="bh-model" title="${escHtml(model)}">${escHtml(model)}</span>
+            </div>
+            <div class="bh-when">${escHtml(when)}</div>`;
           if (!r.success) {
-            return `<div class="bench-history-row">${profile} ${escHtml(when)}<br/>FAIL: ${escHtml(r.error || 'Unknown error')}</div>`;
+            return `<div class="bench-history-row bh-fail">${head}
+              <div class="bh-metrics bh-error">FAIL: ${escHtml(r.error || 'Unknown error')}</div>
+            </div>`;
           }
-          const p = Number(r.prefill_tps || 0).toFixed(2);
-          const g = Number(r.gen_tps || 0).toFixed(2);
-          return `<div class="bench-history-row">${profile} ${escHtml(when)}<br/>P ${p} T/S | G ${g} T/S</div>`;
+          const p = Number(r.prefill_tps || 0).toFixed(1);
+          const g = Number(r.gen_tps || 0).toFixed(1);
+          const acc = (typeof r.draft_acceptance === 'number')
+            ? `<span class="bh-metric"><b>Draft</b> ${(r.draft_acceptance * 100).toFixed(0)}%</span>` : '';
+          return `<div class="bench-history-row">${head}
+            <div class="bh-metrics">
+              <span class="bh-metric"><b>Prefill</b> ${p}</span>
+              <span class="bh-metric"><b>Gen</b> ${g}</span>${acc}
+            </div>
+          </div>`;
         }).join('');
       }
 
@@ -3815,13 +5444,188 @@ INDEX_HTML = r"""<!doctype html>
       document.getElementById('procTable').innerHTML = procs;
 
       // Switch status
-      document.getElementById('switchStatus').textContent = data.last_message || '';
+      renderSwitchStatus(data);
 
       // Sidebar
       buildSidebar(data);
 
       // Events & Logs
       updateEventsPanel(data);
+    }
+
+    // Seconds the dashboard has been showing "switching" — drives the stuck-state hint.
+    const SWITCH_STUCK_HINT_SEC = 180;
+
+    function renderSwitchStatus(data) {
+      const el = document.getElementById('switchStatus');
+      const msg = data.last_message || '';
+      if (!data.switch_in_progress) {
+        el.className = 'switch-status-bar';
+        el.textContent = msg;
+        return;
+      }
+      const startedMs = data.last_started_at ? Date.parse(data.last_started_at) : NaN;
+      const elapsed = Number.isNaN(startedMs) ? 0 : Math.max(0, Math.round((Date.now() - startedMs) / 1000));
+      const stuck = elapsed >= SWITCH_STUCK_HINT_SEC;
+      el.className = 'switch-status-bar switch-active' + (stuck ? ' switch-stuck' : '');
+      el.innerHTML = `
+        <span class="switch-spin"></span>
+        <span class="switch-msg">${escHtml(msg || 'Switching...')}</span>
+        <span class="switch-elapsed">${fmtElapsed(elapsed)}</span>
+        <button class="switch-clear" onclick="clearSwitchState()"
+          title="Force the dashboard out of the switching state. Does not stop the container.">
+          Force clear
+        </button>`;
+    }
+
+    function fmtElapsed(sec) {
+      if (sec < 60) return `${sec}s`;
+      const m = Math.floor(sec / 60);
+      return `${m}m ${String(sec % 60).padStart(2, '0')}s`;
+    }
+
+    async function clearSwitchState() {
+      try {
+        const r = await fetch('/api/switch/clear', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}'
+        });
+        const d = await r.json().catch(() => ({}));
+        if (d.status) { lastData = d.status; updateDashboard(d.status); }
+      } catch (e) {
+        const el = document.getElementById('switchStatus');
+        el.className = 'switch-status-bar';
+        el.textContent = `Could not clear switch state: ${e}`;
+      }
+      refresh();
+    }
+
+    // ── Settings ──────────────────────────────────────────────────────────────
+    let settingsData = null;
+    const settingsInspectTimers = {};
+
+    async function openSettings() {
+      closeSidebar();
+      document.getElementById('settingsModal').classList.add('active');
+      setSettingsStatus('');
+      const body = document.getElementById('settingsBody');
+      body.innerHTML = '<div class="rd-note">Loading…</div>';
+      try {
+        const r = await fetch('/api/settings');
+        settingsData = await r.json();
+        renderSettings(settingsData);
+      } catch (e) {
+        body.innerHTML = `<div class="rd-note">Could not load settings: ${escHtml(String(e))}</div>`;
+      }
+    }
+
+    function closeSettings() {
+      document.getElementById('settingsModal').classList.remove('active');
+    }
+
+    function setSettingsStatus(msg, kind) {
+      const el = document.getElementById('settingsStatus');
+      el.className = 'settings-status' + (kind ? ' ' + kind : '');
+      el.textContent = msg || '';
+    }
+
+    function checkLine(item) {
+      if (!item.exists) {
+        return `<span class="set-check set-check-bad">✕ Not found inside the container — is this path bind-mounted?</span>`;
+      }
+      if (!item.is_dir) return `<span class="set-check set-check-bad">✕ Exists but is not a folder</span>`;
+      if (!item.readable) return `<span class="set-check set-check-bad">✕ Not readable</span>`;
+      if (!item.scans) return `<span class="set-check set-check-ok">✓ Folder found</span>`;
+      if (!item.stack_count) {
+        return `<span class="set-check set-check-warn">⚠ Folder found, but no *.yml with an <code>LLM_META display_name</code> header (${item.yml_count} yml file${item.yml_count === 1 ? '' : 's'})</span>`;
+      }
+      return `<span class="set-check set-check-ok">✓ ${item.stack_count} stack${item.stack_count === 1 ? '' : 's'} found (${item.yml_count} yml file${item.yml_count === 1 ? '' : 's'})</span>`;
+    }
+
+    function renderSettings(d) {
+      const scanned = d.settings.filter(s => s.scans);
+      const other = d.settings.filter(s => !s.scans);
+      const row = (s) => `
+        <div class="set-row" data-key="${s.key}">
+          <div class="set-row-head">
+            <span class="set-label">${escHtml(s.label)}</span>
+            <span class="set-src set-src-${s.source}">${s.source}</span>
+          </div>
+          <div class="set-help">${escHtml(s.help)}</div>
+          <input class="set-input" id="set-${s.key}" value="${escHtml(s.value)}"
+                 spellcheck="false" autocomplete="off"
+                 oninput="onSettingInput('${s.key}')" placeholder="/absolute/path" />
+          <div id="check-${s.key}">${checkLine(s)}</div>
+          ${s.env_value && s.source === 'settings'
+            ? `<div class="set-envnote">Overrides ${escHtml(s.env_name)}=${escHtml(s.env_value)}</div>` : ''}
+        </div>`;
+      document.getElementById('settingsBody').innerHTML = `
+        <div class="set-intro">
+          Paths are resolved <b>inside the gpu-monitor container</b>. A folder that is not
+          bind-mounted in <code>docker-compose.yml</code> will not be visible here, however
+          correct it looks on the host.<br/>
+          Saved values are written to <code>${escHtml(d.settings_path)}</code> and take
+          precedence over the <code>${'$'}STACKS_DIR</code>-style environment variables that
+          compose sets. Clear a field to fall back to env / config.
+          ${d.writable ? '' : '<br/><b style="color:var(--danger)">This file is not writable — saving will fail.</b>'}
+        </div>
+        <div class="set-section">Stack folders</div>
+        ${scanned.map(row).join('')}
+        <div class="set-section">Other paths</div>
+        ${other.map(row).join('')}`;
+    }
+
+    function onSettingInput(key) {
+      setSettingsStatus('');
+      clearTimeout(settingsInspectTimers[key]);
+      const box = document.getElementById(`check-${key}`);
+      box.innerHTML = '<span class="set-check set-check-idle">Checking…</span>';
+      // Debounced so a typed path is not stat()ed on every keystroke.
+      settingsInspectTimers[key] = setTimeout(async () => {
+        const val = document.getElementById(`set-${key}`).value.trim();
+        if (!val) {
+          box.innerHTML = '<span class="set-check set-check-idle">Empty — will fall back to env / config / default</span>';
+          return;
+        }
+        const meta = settingsData.settings.find(s => s.key === key) || { scans: false };
+        try {
+          const r = await fetch(`/api/settings/inspect?path=${encodeURIComponent(val)}`);
+          const d = await r.json();
+          if (d.error) { box.innerHTML = `<span class="set-check set-check-bad">✕ ${escHtml(d.error)}</span>`; return; }
+          box.innerHTML = checkLine({ ...d, scans: meta.scans });
+        } catch (e) {
+          box.innerHTML = `<span class="set-check set-check-bad">✕ ${escHtml(String(e))}</span>`;
+        }
+      }, 350);
+    }
+
+    async function saveSettings() {
+      if (!settingsData) return;
+      const btn = document.getElementById('btnSaveSettings');
+      const payload = {};
+      for (const s of settingsData.settings) {
+        payload[s.key] = document.getElementById(`set-${s.key}`).value.trim();
+      }
+      btn.disabled = true;
+      setSettingsStatus('Saving…');
+      try {
+        const r = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ settings: payload })
+        });
+        const d = await r.json();
+        if (!r.ok) { setSettingsStatus(d.error || `Save failed (${r.status})`, 'err'); return; }
+        settingsData = d;
+        renderSettings(d);
+        setSettingsStatus('Saved — model list reloaded.', 'ok');
+        refresh();
+      } catch (e) {
+        setSettingsStatus(String(e), 'err');
+      } finally {
+        btn.disabled = false;
+      }
     }
 
     function confirmSwitch(key, label) {
@@ -4236,9 +6040,12 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
-    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeRequestDetail(); closeSidebar(); } });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeRequestDetail(); closeSettings(); closeSidebar(); } });
 
     initChart();
+    initThermalChart();
+    buildRangePicker();
+    setChartRange(chartRange);
     refresh();
     setInterval(refresh, 500);
     refreshRequestLog(true);
@@ -4308,6 +6115,18 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/api/status":
             status = build_status(self)
             self._send_json(status)
+        elif route == "/api/settings":
+            self._send_json(describe_settings())
+        elif route == "/api/settings/inspect":
+            q = parse_qs(parsed.query)
+            raw = (q.get("path") or [""])[0].strip()
+            if not raw.startswith("/"):
+                self._send_json({"error": "Path must be absolute", "path": raw}, 400)
+            else:
+                self._send_json({"path": raw, **inspect_stack_dir(Path(raw))})
+        elif route == "/api/metrics/history":
+            q = parse_qs(parsed.query)
+            self._send_json(read_metrics_history((q.get("range") or ["1h"])[0]))
         elif route == "/api/request-log":
             self._send_json(read_request_log(parse_qs(parsed.query)))
         elif route == "/api/request-log/detail":
@@ -4336,6 +6155,35 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": msg}, 409)
             else:
                 self._send_json({"message": msg, "status": build_status(self)})
+            self._finish_request("POST", self.path)
+            return
+
+        if self.path == "/api/settings":
+            values = body.get("settings")
+            if not isinstance(values, dict):
+                self._send_json({"error": "Expected a 'settings' object"}, 400)
+                self._finish_request("POST", self.path)
+                return
+            ok, msg = apply_settings(values)
+            if not ok:
+                self._send_json({"error": msg}, 400)
+            else:
+                self._send_json({"message": msg, **describe_settings()})
+            self._finish_request("POST", self.path)
+            return
+
+        if self.path == "/api/switch/clear":
+            # Manual escape hatch: drop a wedged "Loading..." state so the UI unlocks
+            # without waiting for SWITCH_STALE_SEC or restarting the dashboard.
+            was_active = _clear_switch_state(
+                "Switch state cleared manually",
+                log="Switch state cleared manually from the dashboard",
+            )
+            self._send_json({
+                "message": "Switch state cleared" if was_active else "No switch was in progress",
+                "cleared": was_active,
+                "status": build_status(self),
+            })
             self._finish_request("POST", self.path)
             return
 
@@ -4412,32 +6260,43 @@ class Handler(BaseHTTPRequestHandler):
                     if error:
                         BENCHMARK_STATE["last_error"] = error
                         _append_log_event("error", "benchmark", f"Benchmark failed for {model_label}: {error}")
-                        BENCHMARK_STATE["history"].append({
+                        entry = {
                             "profile": benchmark_profile,
                             "model_key": model_key,
+                            "model_label": model_label,
                             "started_at": started_iso,
                             "completed_at": completed_iso,
                             "duration_sec": elapsed,
                             "success": False,
                             "error": error,
-                        })
+                        }
+                        BENCHMARK_STATE["history"].append(entry)
+                        save_benchmark_run(entry)
                     elif result is not None:
                         result["started_at"] = started_iso
                         result["completed_at"] = completed_iso
                         result["duration_sec"] = elapsed
+                        result["model_key"] = model_key
+                        result["model_label"] = model_label
                         BENCHMARK_STATE["last_result"] = result
                         BENCHMARK_STATE["last_error"] = None
-                        _append_log_event("info", "benchmark", f"Benchmark ({benchmark_profile}) for {model_label}: prefill {result['prefill_tps']:.1f} T/S, gen {result['gen_tps']:.1f} T/S")
-                        BENCHMARK_STATE["history"].append({
+                        accept = result.get("draft_acceptance")
+                        accept_txt = f", draft accept {accept * 100:.0f}%" if isinstance(accept, float) else ""
+                        _append_log_event("info", "benchmark", f"Benchmark ({benchmark_profile}) for {model_label}: prefill {result['prefill_tps']:.1f} T/S, gen {result['gen_tps']:.1f} T/S{accept_txt}")
+                        entry = {
                             "profile": benchmark_profile,
                             "model_key": model_key,
+                            "model_label": model_label,
                             "started_at": started_iso,
                             "completed_at": completed_iso,
                             "duration_sec": elapsed,
                             "success": True,
                             "prefill_tps": result["prefill_tps"],
                             "gen_tps": result["gen_tps"],
-                        })
+                            "draft_acceptance": result.get("draft_acceptance"),
+                        }
+                        BENCHMARK_STATE["history"].append(entry)
+                        save_benchmark_run(entry)
                     else:
                         BENCHMARK_STATE["last_error"] = "Benchmark failed without result"
                     BENCHMARK_STATE["history"] = BENCHMARK_STATE["history"][-FULL_BENCHMARK_MAX_HISTORY:]
@@ -4529,6 +6388,10 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     if not SWITCH_SCRIPT.exists():
         raise SystemExit(f"Missing switch script: {SWITCH_SCRIPT}")
+
+    if init_metrics_db():
+        restore_benchmark_history()
+        threading.Thread(target=_run_metrics_sampler, daemon=True, name="metrics-sampler").start()
 
     threading.Thread(target=_run_log_watcher, daemon=True, name="log-watcher").start()
 

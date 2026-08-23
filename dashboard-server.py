@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 REQUEST_LOG_DB = os.environ.get("REQUEST_LOG_DB", "/request-logs/requests.db")
+VLLM_API_KEY_FILE = os.environ.get("VLLM_API_KEY_FILE", "")
 
 # Columns returned by /api/request-log (subset/order for the UI table).
 _REQUEST_LOG_COLUMNS = [
@@ -721,6 +723,7 @@ VLLM_INGEST_STATE = {
     "container": None,
     "sampled_at": 0.0,
     "prompt_tokens": None,
+    "prefill_seconds": None,
 }
 
 EVAL_TPS_PATTERN = re.compile(
@@ -1413,6 +1416,23 @@ def _parse_prometheus_metrics(raw: str) -> dict:
     return result
 
 
+KV_CACHE_SIZE_TOKENS_PATTERN = re.compile(r'kv_cache_size_tokens="(\d+)"')
+
+
+def _parse_vllm_kv_cache_size_tokens(raw: str) -> int | None:
+    """Total KV-cache capacity in tokens, from vllm:cache_config_info labels."""
+    for line in raw.splitlines():
+        if line.startswith("vllm:cache_config_info"):
+            m = KV_CACHE_SIZE_TOKENS_PATTERN.search(line)
+            if m:
+                try:
+                    val = int(m.group(1))
+                except ValueError:
+                    return None
+                return val if val > 0 else None
+    return None
+
+
 def parse_vllm_metrics(raw: str, active_key: str) -> dict:
     """Parse vLLM Prometheus metrics and compute TPS.
 
@@ -1444,8 +1464,25 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
     prompt_tokens_sum = get_metric("request_prompt_tokens_sum")
     prompt_tokens_count = get_metric("request_prompt_tokens_count")
 
-    # Cache usage
-    gpu_cache_usage = get_metric("gpu_cache_usage_perc")
+    # Prefill / decode phase time (vLLM reports these per finished request)
+    prefill_time_sum = get_metric("request_prefill_time_seconds_sum")
+    prefill_time_count = get_metric("request_prefill_time_seconds_count")
+
+    # Cache usage. vLLM renamed gpu_cache_usage_perc -> kv_cache_usage_perc in 0.10, and
+    # get_metric() defaults missing metrics to 0 — which is why the context widget read a
+    # hard 0 on modern vLLM. Keep None when neither name is present so "unknown" and
+    # "genuinely empty" stay distinguishable.
+    gpu_cache_usage = None
+    for _usage_name in ("kv_cache_usage_perc", "gpu_cache_usage_perc"):
+        for _key in (f"vllm:{_usage_name}", _usage_name):
+            if _key in parsed:
+                gpu_cache_usage = float(parsed[_key])
+                break
+        if gpu_cache_usage is not None:
+            break
+
+    # Total tokens the KV cache can hold, from the cache_config_info labels.
+    kv_cache_size_tokens = _parse_vllm_kv_cache_size_tokens(raw)
 
     # Compute live TPS (delta-based)
     now = time.time()
@@ -1465,22 +1502,31 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
         VLLM_TPS_STATE["sampled_at"] = now
         VLLM_TPS_STATE["generation_tokens"] = gen_total
 
-    # Compute live ingest TPS (delta-based)
+    # Compute live ingest TPS.
+    # Divide the prompt-token delta by the delta of vLLM's own PREFILL phase time, not by
+    # wall time between polls. prompt_tokens_total jumps by the whole prompt the moment a
+    # request is accounted for, so wall-clock division reports six-figure "ingest" rates
+    # whenever the poll window happens to be shorter than the prefill it contains.
     with VLLM_INGEST_STATE_LOCK:
         prev_ingest_container = VLLM_INGEST_STATE.get("container")
         prev_ingest_sampled = VLLM_INGEST_STATE.get("sampled_at", 0)
         prev_ingest = VLLM_INGEST_STATE.get("prompt_tokens")
+        prev_prefill_seconds = VLLM_INGEST_STATE.get("prefill_seconds")
 
         live_ingest_tps = None
         if (prev_ingest_container and prev_ingest is not None and
                 prev_ingest_sampled > 0 and prev_ingest <= prompt_total):
-            dt = now - prev_ingest_sampled
-            if dt > 0:
-                live_ingest_tps = (prompt_total - prev_ingest) / dt
+            d_tokens = prompt_total - prev_ingest
+            d_prefill = None
+            if prev_prefill_seconds is not None and prefill_time_sum >= prev_prefill_seconds:
+                d_prefill = prefill_time_sum - prev_prefill_seconds
+            if d_tokens > 0 and d_prefill and d_prefill > 0:
+                live_ingest_tps = d_tokens / d_prefill
 
         VLLM_INGEST_STATE["container"] = active_key
         VLLM_INGEST_STATE["sampled_at"] = now
         VLLM_INGEST_STATE["prompt_tokens"] = prompt_total
+        VLLM_INGEST_STATE["prefill_seconds"] = prefill_time_sum if prefill_time_count > 0 else None
 
     # Averages
     avg_gen_per_request = gen_tokens_sum / gen_tokens_count if gen_tokens_count > 0 else None
@@ -1506,6 +1552,7 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
         "gen_total": gen_total,
         "prompt_total": prompt_total,
         "gpu_cache_usage_perc": gpu_cache_usage,
+        "kv_cache_size_tokens": kv_cache_size_tokens,
         "completed_requests": gen_tokens_count,
     }
 
@@ -1901,6 +1948,7 @@ def build_vllm_throughput_status() -> dict:
             "total_requests_approx": parsed["total_requests_approx"],
             "completion_key": f"vllm-reqs:{parsed['completed_requests']}",
             "gpu_cache_usage_perc": parsed["gpu_cache_usage_perc"],
+            "kv_cache_size_tokens": parsed["kv_cache_size_tokens"],
         }
 
     with VLLM_METRICS_CACHE_LOCK:
@@ -1909,6 +1957,7 @@ def build_vllm_throughput_status() -> dict:
         if code == 0:
             VLLM_METRICS_CACHE["raw"] = output
             VLLM_METRICS_CACHE["gpu_cache_usage_perc"] = parsed["gpu_cache_usage_perc"]
+            VLLM_METRICS_CACHE["kv_cache_size_tokens"] = parsed["kv_cache_size_tokens"]
             VLLM_METRICS_CACHE["generation_tokens_total"] = parsed["gen_total"]
             VLLM_METRICS_CACHE["prompt_tokens_total"] = parsed["prompt_total"]
             VLLM_METRICS_CACHE["iteration_tokens_total_sum"] = parsed["avg_iter_tokens"] * parsed["total_requests_approx"] if parsed["avg_iter_tokens"] else 0
@@ -1959,7 +2008,8 @@ def _build_vllm_throughput_from_cache(container: str) -> dict:
         "avg_prompt_per_request": avg_prompt_per_request,
         "total_requests_approx": max(iter_count, queue_count, gen_tokens_count),
         "completion_key": f"vllm-reqs:{gen_tokens_count}",
-        "gpu_cache_usage_perc": cache.get("gpu_cache_usage_perc", 0),
+        "gpu_cache_usage_perc": cache.get("gpu_cache_usage_perc"),
+        "kv_cache_size_tokens": cache.get("kv_cache_size_tokens"),
     }
 
 
@@ -2129,7 +2179,7 @@ BENCHMARK_TASK_INSTRUCTION = (
 )
 
 
-def build_benchmark_prompt(estimated_tokens: int, seed: int = 0) -> str:
+def build_benchmark_prompt(estimated_tokens: int, seed: int = 0, nonce: str = "") -> str:
     """Build a benchmark prompt that produces *representative* generation work.
 
     A prompt of one repeated token (the previous implementation) is a pathological
@@ -2145,8 +2195,12 @@ def build_benchmark_prompt(estimated_tokens: int, seed: int = 0) -> str:
     word_count = max(16, int(round(pad_tokens / BENCHMARK_TOKENS_PER_FILLER_WORD)))
     rnd = random.Random(seed * 7919 + estimated_tokens)
     filler = " ".join(rnd.choice(BENCHMARK_FILLER_WORDS) for _ in range(word_count))
+    # The nonce sits at the very front so no block of the prompt can be served from a
+    # prefix cache. A cached prefill measures cache lookup speed, not ingest speed.
+    prefix = f"RUN-ID {nonce}\n" if nonce else ""
     return (
-        "You are a throughput benchmark harness. The block below is opaque filler. "
+        prefix
+        + "You are a throughput benchmark harness. The block below is opaque filler. "
         "Do not read, repeat, quote, or refer to it.\n\nFILLER:\n"
         + filler
         + "\n\n"
@@ -2170,6 +2224,29 @@ def _get_server_port(active_key: str) -> int:
     return models.get(active_key, {}).get("internal_port", 8080)
 
 
+def _vllm_phase_snapshot(container: str, port: int, auth_args: list[str]) -> dict | None:
+    """Read the vLLM Prometheus counters the benchmark needs, or None if unreadable."""
+    code, out = run_command([
+        "docker", "exec", container, "curl", "-fsS", "--max-time", "5", *auth_args,
+        f"http://127.0.0.1:{port}/metrics",
+    ])
+    if code != 0:
+        return None
+    parsed = _parse_prometheus_metrics(out)
+
+    def g(name: str) -> float:
+        return float(parsed.get(f"vllm:{name}", parsed.get(name, 0)))
+
+    return {
+        "prefill_sum": g("request_prefill_time_seconds_sum"),
+        "prefill_count": g("request_prefill_time_seconds_count"),
+        "decode_sum": g("request_decode_time_seconds_sum"),
+        "decode_count": g("request_decode_time_seconds_count"),
+        "cache_queries": g("prefix_cache_queries_total"),
+        "cache_hits": g("prefix_cache_hits_total"),
+    }
+
+
 def run_single_benchmark(
     active_key: str,
     containers: list[dict],
@@ -2189,10 +2266,21 @@ def run_single_benchmark(
 
     port = _get_server_port(active_key)
 
+    auth_args = []
     if is_vllm:
+        if VLLM_API_KEY_FILE:
+            try:
+                api_key = Path(VLLM_API_KEY_FILE).read_text(encoding="utf-8").strip()
+                if api_key:
+                    auth_args = ["-H", f"Authorization: Bearer {api_key}"]
+            except OSError:
+                pass
         # Fetch valid model ID from vLLM
         model_id = "qwen"
-        code_model, out_model = run_command(["docker", "exec", container, "curl", "-s", f"http://127.0.0.1:{port}/v1/models"])
+        code_model, out_model = run_command([
+            "docker", "exec", container, "curl", "-s", *auth_args,
+            f"http://127.0.0.1:{port}/v1/models",
+        ])
         if code_model == 0:
             try:
                 models_data = json.loads(out_model)
@@ -2207,7 +2295,7 @@ def run_single_benchmark(
         # to the server's own configuration so the benchmark reflects real serving settings.
         payload = {
             "model": model_id,
-            "prompt": build_benchmark_prompt(prompt_tokens, seed),
+            "prompt": build_benchmark_prompt(prompt_tokens, seed, nonce=uuid.uuid4().hex[:16]),
             "max_tokens": n_predict,
             "min_tokens": n_predict,
             "ignore_eos": True,
@@ -2242,9 +2330,12 @@ def run_single_benchmark(
         endpoint,
         "-H",
         "Content-Type: application/json",
+        *auth_args,
         "-d",
         json.dumps(payload),
     ]
+    pre_snapshot = _vllm_phase_snapshot(container, port, auth_args) if is_vllm else None
+
     start_t = time.time()
     code, output = run_command(cmd)
     end_t = time.time()
@@ -2291,16 +2382,57 @@ def run_single_benchmark(
         
         prompt_n = usage.get("prompt_tokens", prompt_tokens)
         gen_n = usage.get("completion_tokens", n_predict)
-        
-        # Accurate speeds from TTFT
-        # ttft here is time_starttransfer, which for a stream is when the first chunk (first token) arrived.
-        # This is a very good measure of prefill time.
-        prefill_tps = prompt_n / ttft if ttft > 0 else 0.0
-        
-        # Generation time is total wall duration minus prefill time
-        gen_duration = duration - ttft
-        gen_tps = gen_n / gen_duration if gen_duration > 0 else 0.0
-        
+
+        # Phase times come from vLLM's own PREFILL/DECODE histograms, not from curl.
+        # %{time_starttransfer} is the first *byte* of the response, and vLLM flushes SSE
+        # headers the moment the stream opens — long before the first token — so using it
+        # as TTFT made prefill look ~100x faster than it is (six-figure ingest T/S).
+        prefill_sec = None
+        decode_sec = None
+        cache_hit_ratio = None
+        timing_source = "vllm_phase_metrics"
+        post_snapshot = None
+        if pre_snapshot:
+            # The histograms are only updated when the request finishes, which can land
+            # just after the response body does — retry briefly before giving up.
+            for _ in range(6):
+                post_snapshot = _vllm_phase_snapshot(container, port, auth_args)
+                if post_snapshot and post_snapshot["prefill_count"] > pre_snapshot["prefill_count"]:
+                    break
+                time.sleep(0.25)
+        if pre_snapshot and post_snapshot:
+            d_prefill_count = post_snapshot["prefill_count"] - pre_snapshot["prefill_count"]
+            d_decode_count = post_snapshot["decode_count"] - pre_snapshot["decode_count"]
+            # Only trust the deltas if exactly our request finished in the window;
+            # concurrent traffic would fold someone else's phases into ours.
+            if d_prefill_count == 1:
+                val = post_snapshot["prefill_sum"] - pre_snapshot["prefill_sum"]
+                if val > 0:
+                    prefill_sec = val
+            if d_decode_count == 1:
+                val = post_snapshot["decode_sum"] - pre_snapshot["decode_sum"]
+                if val > 0:
+                    decode_sec = val
+            d_queries = post_snapshot["cache_queries"] - pre_snapshot["cache_queries"]
+            d_hits = post_snapshot["cache_hits"] - pre_snapshot["cache_hits"]
+            if d_queries > 0:
+                cache_hit_ratio = d_hits / d_queries
+
+        if prefill_sec is None:
+            # Fallback: wall duration minus measured decode, else the old TTFT estimate.
+            timing_source = "wall_clock_fallback"
+            if decode_sec is not None and duration > decode_sec:
+                prefill_sec = duration - decode_sec
+            elif ttft > 0:
+                prefill_sec = ttft
+        if decode_sec is None:
+            timing_source = "wall_clock_fallback"
+            if prefill_sec is not None and duration > prefill_sec:
+                decode_sec = duration - prefill_sec
+
+        prefill_tps = prompt_n / prefill_sec if prefill_sec and prefill_sec > 0 else 0.0
+        gen_tps = gen_n / decode_sec if decode_sec and decode_sec > 0 else 0.0
+
         return (
             {
                 "container": container,
@@ -2310,11 +2442,13 @@ def run_single_benchmark(
                 "gen_tokens": gen_n,
                 # Expose the same ms fields llama.cpp gives us so the full-profile
                 # aggregate can weight every run the same way.
-                "prompt_ms": ttft * 1000.0,
-                "gen_ms": max(0.0, gen_duration) * 1000.0,
+                "prompt_ms": (prefill_sec or 0.0) * 1000.0,
+                "gen_ms": (decode_sec or 0.0) * 1000.0,
                 "is_vllm": True,
                 "duration_sec": duration,
-                "ttft_sec": ttft
+                "ttft_sec": ttft,
+                "prefix_cache_hit_ratio": cache_hit_ratio,
+                "timing_source": timing_source,
             },
             None,
         )
@@ -3289,12 +3423,20 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
     )
 
     context_info = {"n_ctx": None, "n_past": None}
-    if _key_is_vllm(active_key) and throughput.get("gpu_cache_usage_perc") is not None:
+    if _key_is_vllm(active_key):
         try:
             m = models.get(active_key) or {}
             ctx_size = int(m.get("ctx_size", 32768))
             context_info["n_ctx"] = ctx_size
-            context_info["n_past"] = int(ctx_size * throughput["gpu_cache_usage_perc"])
+            usage = throughput.get("gpu_cache_usage_perc")
+            kv_tokens = throughput.get("kv_cache_size_tokens")
+            if usage is not None and kv_tokens:
+                # Scale by real KV-cache capacity, not by ctx_size: the cache holds far more
+                # tokens than one context window (304k vs 147k here), so multiplying the
+                # usage fraction by ctx_size understates what is resident. Report tokens.
+                context_info["n_past"] = min(ctx_size, int(round(usage * kv_tokens)))
+            elif usage is not None:
+                context_info["n_past"] = int(round(ctx_size * usage))
         except (ValueError, KeyError):
             pass
 
@@ -4209,24 +4351,20 @@ INDEX_HTML = r"""<!doctype html>
     /* An idle status bar was costing ~46px of the log's height for an empty line. */
     .switch-status-bar:empty { display: none; }
 
-    /* The right column used to be one tall card, which forced a dead gap beside
-       the short process table. Two cards + a stretched left column closes it. */
-    /* True 2×2 grid: both columns share the same row boundaries, so the seam
-       between the top chart and the Power/Thermals + Processes band always
-       lines up with the seam between Service Details and Benchmark, whatever
-       the panels' content heights are. */
+    /* The right side is one card spanning both rows: Service Details on top,
+       Benchmark below, split by a hairline. Fewer seams than two stacked cards,
+       and the card's natural height sets how much is left for the request log. */
     .content-grid {
       grid-template-columns: minmax(0, 1fr) 348px;
-      grid-template-rows: auto minmax(214px, auto);
-      grid-template-areas: "chart details" "lower bench";
+      grid-template-rows: auto minmax(152px, auto);
+      grid-template-areas: "chart details" "lower details";
       gap: 10px; align-items: stretch;
     }
     .content-grid > .chart-panel { grid-area: chart; }
-    .content-grid > .info-panel:not(.bench-panel) { grid-area: details; }
     .content-grid > .lower-row { grid-area: lower; }
-    .content-grid > .bench-panel { grid-area: bench; }
+    .content-grid > .details-bench-panel { grid-area: details; min-height: 0; }
     .info-panel { padding: 13px 15px; gap: 9px; }
-    .bench-panel { min-height: 0; }
+    .details-bench-sep { border-top: 1px solid var(--border); margin: 4px 0 1px; }
     /* The process list is almost always a single llama-server row, so it gets a
        half-width slot and the reclaimed space goes to a second chart beside it. */
     /* min-height, not height: the panel stretches when Service Details is the
@@ -4277,7 +4415,7 @@ INDEX_HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
       gap: 10px;
-      min-height: 214px;
+      min-height: 152px;
     }
     .chart-panel-sm { height: auto; }
     .table-panel {
@@ -4377,9 +4515,9 @@ INDEX_HTML = r"""<!doctype html>
       letter-spacing: -0.5px; color: #9cc0ff; white-space: nowrap;
     }
     .bench-hl-gen { color: #6fe3b6; }
-    /* History scrolls inside the benchmark card so the card cannot push the log down. */
-    .bench-panel { min-height: 0; }
-    .bench-panel > .info-item:last-child { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 3px; }
+    /* The last item (history) absorbs leftover card height and scrolls, so the
+       card cannot push the request log down. */
+    .details-bench-panel > .info-item:last-child { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 3px; }
     .bench-history { max-height: none; flex: 1; min-height: 84px; }
 
     /* ── Sidebar polish ── */
@@ -4411,9 +4549,9 @@ INDEX_HTML = r"""<!doctype html>
          must stay auto-height so it fills its grid row. */
       .content-grid > .chart-panel { height: auto; min-height: 248px; }
       .chart-panel-sm { height: auto; }
-      /* The grid stretches to the taller column, so the side column's natural height
-         sets how much is left for the log. The history list scrolls either way, so
-         capping it trades list height the user rarely needs for log height they do. */
+      /* The merged card spans both rows, so an unbounded benchmark list would
+         inflate the whole grid and push the request log off the viewport; cap
+         the list (min-height 84 above clamps it just below one row). */
       .bench-history { max-height: 76px; }
       .info-panel { gap: 7px; padding: 12px 15px; }
       .activity-panel {
@@ -4439,7 +4577,7 @@ INDEX_HTML = r"""<!doctype html>
       .content-grid {
         grid-template-columns: minmax(0, 1fr);
         grid-template-rows: none;
-        grid-template-areas: "chart" "lower" "details" "bench";
+        grid-template-areas: "chart" "lower" "details";
       }
       .chart-panel { height: 300px; }
       .chart-panel-sm { height: 260px; }
@@ -4637,7 +4775,7 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           </div>
 
-          <div class="info-panel">
+          <div class="info-panel details-bench-panel">
             <div class="section-title">Service Details</div>
             <div class="info-item">
               <div class="info-label">Active Model</div>
@@ -4666,9 +4804,8 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="info-value" id="info-power">--W / --W</div>
               </div>
             </div>
-          </div>
+            <div class="details-bench-sep"></div>
 
-          <div class="info-panel bench-panel">
             <div class="section-title">Benchmark</div>
             <div class="bench-btn-row">
               <button class="btn-benchmark" id="btnBenchmark" onclick="triggerBenchmark('balanced')">QUICK</button>

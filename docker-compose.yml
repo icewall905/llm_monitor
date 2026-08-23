@@ -15,6 +15,7 @@ services:
       - REQUEST_LOG_DB=${REQUEST_LOG_DB:-/request-logs/requests.db}
       - VLLM_DIR=${VLLM_DIR:-/mnt/nvmestorage/compose/vllm}
       - VLLM_SERVER_SERVICE=${VLLM_SERVER_SERVICE:-vllm-server}
+      - VLLM_API_KEY_FILE=${VLLM_API_KEY_FILE:-/mnt/nvmestorage/compose/vllm/qwen38-27b-rtx3090/api_key.txt}
       - BEELLAMA_DIR=${BEELLAMA_DIR:-/mnt/nvmestorage/compose/beellama.cpp}
     stdin_open: true
     tty: true

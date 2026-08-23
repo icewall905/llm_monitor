@@ -581,6 +581,11 @@ def discover_models() -> dict:
                 "ctx_size":       meta.get("ctx_size", ""),
                 "quant":          meta.get("quant", ""),
                 "params":         meta.get("params", ""),
+                # Slot cap for the "Streams" card's denominator. vLLM does NOT publish
+                # max_num_seqs in /metrics (checked 2026-08-23: cache_config_info carries
+                # kv_cache_size_tokens and kv_cache_max_concurrency, but no slot count), so
+                # it has to come from the stack header like ctx_size and quant do.
+                "max_seqs":       meta.get("max_seqs", ""),
                 "vllm":           True,
             }
         if not vllm_entries:
@@ -712,11 +717,16 @@ VLLM_METRICS_CACHE = {
     "request_prompt_tokens_sum": 0.0,
     "request_prompt_tokens_count": 0.0,
 }
+# Minimum delta window for the vLLM live-rate calculations. Must be comfortably WIDER
+# than VLLM_METRICS_CACHE_TTL_SEC, or the baseline advances faster than tokens accumulate
+# and the rate collapses to 0 under steady load.
+VLLM_TPS_MIN_WINDOW_SEC = float(os.environ.get("VLLM_TPS_MIN_WINDOW_SEC", "3.0"))
 VLLM_TPS_STATE_LOCK = threading.Lock()
 VLLM_TPS_STATE = {
     "container": None,
     "sampled_at": 0.0,
     "generation_tokens": None,
+    "last_tps": None,
 }
 VLLM_INGEST_STATE_LOCK = threading.Lock()
 VLLM_INGEST_STATE = {
@@ -724,6 +734,7 @@ VLLM_INGEST_STATE = {
     "sampled_at": 0.0,
     "prompt_tokens": None,
     "prefill_seconds": None,
+    "last_ingest_tps": None,
 }
 
 EVAL_TPS_PATTERN = re.compile(
@@ -1433,6 +1444,59 @@ def _parse_vllm_kv_cache_size_tokens(raw: str) -> int | None:
     return None
 
 
+KV_MAX_CONCURRENCY_PATTERN = re.compile(r'kv_cache_max_concurrency="([0-9.]+)"')
+
+
+def _parse_vllm_kv_max_concurrency(raw: str) -> float | None:
+    """How many max-length requests the KV pool can hold, from vllm:cache_config_info.
+
+    vLLM computes this itself (pool tokens / max_model_len) and publishes it as a label,
+    so there is no need to recompute it here and get the hybrid-allocator arithmetic wrong.
+    """
+    for line in raw.splitlines():
+        if line.startswith("vllm:cache_config_info"):
+            m = KV_MAX_CONCURRENCY_PATTERN.search(line)
+            if m:
+                try:
+                    val = float(m.group(1))
+                except ValueError:
+                    return None
+                return val if val > 0 else None
+    return None
+
+
+def _sum_labeled_metric(raw: str, name: str) -> float | None:
+    """Sum a counter across all its label sets.
+
+    _parse_prometheus_metrics() keys on the bare metric name, so for a metric published
+    once per label value (request_success_total{finished_reason=...},
+    num_requests_waiting_by_reason{reason=...}) it keeps only whichever line came last.
+    Anything that needs the TOTAL has to re-walk the payload.
+    """
+    prefix = f"vllm:{name}{{"
+    total = None
+    for line in raw.splitlines():
+        if line.startswith(prefix):
+            val = _parse_prometheus_value(line)
+            if val is not None:
+                total = val if total is None else total + val
+    return total
+
+
+def _labeled_metric_map(raw: str, name: str, label: str) -> dict:
+    """{label_value: counter} for a metric published once per label value."""
+    prefix = f"vllm:{name}{{"
+    pat = re.compile(label + r'="([^"]*)"')
+    out = {}
+    for line in raw.splitlines():
+        if line.startswith(prefix):
+            m = pat.search(line)
+            val = _parse_prometheus_value(line)
+            if m and val is not None:
+                out[m.group(1)] = out.get(m.group(1), 0.0) + val
+    return out
+
+
 def parse_vllm_metrics(raw: str, active_key: str) -> dict:
     """Parse vLLM Prometheus metrics and compute TPS.
 
@@ -1468,6 +1532,25 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
     prefill_time_sum = get_metric("request_prefill_time_seconds_sum")
     prefill_time_count = get_metric("request_prefill_time_seconds_count")
 
+    # ⭐ THE HONEST "AVERAGE RATE" FOR vLLM. request_time_per_output_token_seconds is
+    # vLLM's own per-request mean inter-token time, so count/sum is the true average output
+    # rate across every completed request — not, as the llama.cpp-shaped accounting did, an
+    # average of instantaneous delta-TPS readings taken at whatever moments the request
+    # counter happened to tick. Those readings are sampled irregularly and skewed by
+    # whichever polls landed mid-prefill.
+    tpot_sum = get_metric("request_time_per_output_token_seconds_sum")
+    tpot_count = get_metric("request_time_per_output_token_seconds_count")
+    avg_tpot_sec = tpot_sum / tpot_count if tpot_count > 0 else None
+    avg_output_rate_tps = (1.0 / avg_tpot_sec) if avg_tpot_sec and avg_tpot_sec > 0 else None
+
+    # Mean prefill throughput over all completed requests, same treatment: total prompt
+    # tokens accounted for divided by the total time vLLM spent in its prefill phase.
+    avg_prefill_rate_tps = (
+        prompt_total / prefill_time_sum
+        if prefill_time_sum and prefill_time_sum > 0 and prompt_total > 0
+        else None
+    )
+
     # Cache usage. vLLM renamed gpu_cache_usage_perc -> kv_cache_usage_perc in 0.10, and
     # get_metric() defaults missing metrics to 0 — which is why the context widget read a
     # hard 0 on modern vLLM. Keep None when neither name is present so "unknown" and
@@ -1483,24 +1566,110 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
 
     # Total tokens the KV cache can hold, from the cache_config_info labels.
     kv_cache_size_tokens = _parse_vllm_kv_cache_size_tokens(raw)
+    kv_max_concurrency = _parse_vllm_kv_max_concurrency(raw)
 
-    # Compute live TPS (delta-based)
+    # ── Prefix caching. THE prefill lever on a box that offloads KV to host RAM: a cold
+    # prefill runs ~1,100-1,250 tok/s here while a cache hit effectively runs ~12,000, so
+    # hit rate is the single number that predicts perceived latency. Two tiers:
+    #   prefix_cache_*          = GPU-resident blocks
+    #   external_prefix_cache_* = the host-RAM offload tier (--kv-offloading-size)
+    prefix_q = get_metric("prefix_cache_queries_total")
+    prefix_h = get_metric("prefix_cache_hits_total")
+    prefix_hit_rate = (prefix_h / prefix_q) if prefix_q > 0 else None
+    ext_q = get_metric("external_prefix_cache_queries_total")
+    ext_h = get_metric("external_prefix_cache_hits_total")
+    ext_hit_rate = (ext_h / ext_q) if ext_q > 0 else None
+
+    # Share of all prompt tokens that were served from cache instead of prefilled. This is
+    # the saving in the units that matter (tokens not computed), independent of hit COUNT.
+    prompt_cached = get_metric("prompt_tokens_cached_total")
+    prompt_cached_frac = (prompt_cached / prompt_total) if prompt_total > 0 else None
+
+    # Preemptions: the engine evicting a running request because the pool ran out. Each one
+    # is a re-prefill later, so a climbing count means the pool is too small for the traffic
+    # — exactly the trade max_num_seqs and max_num_batched_tokens are balanced against.
+    preemptions = get_metric("num_preemptions_total")
+
+    # Mean tokens per engine step. With speculation off this is effectively the batch size,
+    # so it says whether concurrency is actually being used or requests are arriving serially.
+    # (avg_iter_tokens below is the same figure; kept named for the detail panel.)
+
+    # End-to-end request latency, and inter-token latency as vLLM measures it.
+    e2e_sum = get_metric("e2e_request_latency_seconds_sum")
+    e2e_count = get_metric("e2e_request_latency_seconds_count")
+    avg_e2e_sec = e2e_sum / e2e_count if e2e_count > 0 else None
+    itl_sum = get_metric("inter_token_latency_seconds_sum")
+    itl_count = get_metric("inter_token_latency_seconds_count")
+    avg_itl_sec = itl_sum / itl_count if itl_count > 0 else None
+
+    # ── Speculative decoding. ABSENT ENTIRELY when --speculative-config is off, which is
+    # why every field here stays None rather than 0: "no drafter" and "drafter accepting
+    # nothing" must not look the same. Acceptance collapsing to 0% while the drafter still
+    # burns a forward pass per position is a real failure mode on this box (measured
+    # 2026-08-23: 0.0% on prefix-cache-hit long-context requests, 14.5 tok/s instead of ~45).
+    spec_drafts = get_metric("spec_decode_num_drafts_total")
+    spec_draft_tokens = get_metric("spec_decode_num_draft_tokens_total")
+    spec_accepted = get_metric("spec_decode_num_accepted_tokens_total")
+    spec_present = "vllm:spec_decode_num_draft_tokens_total" in parsed
+    spec_accept_rate = (spec_accepted / spec_draft_tokens) if spec_present and spec_draft_tokens > 0 else None
+    spec_accept_len = (1.0 + spec_accepted / spec_drafts) if spec_present and spec_drafts > 0 else None
+
+    # KV offload traffic, so the host-RAM tier is visible as more than a config flag.
+    offload_read_bytes = get_metric("kv_offload_load_bytes_total") or _sum_labeled_metric(raw, "kv_offload_total_bytes_total") or 0.0
+    offload_store_bytes = get_metric("kv_offload_store_bytes_total") or 0.0
+    offload_cpu_usage = get_metric("kv_offload_cpu_cache_usage_perc")
+
+    # Terminal states, summed across finished_reason labels, plus the queue-reason split.
+    success_by_reason = _labeled_metric_map(raw, "request_success_total", "finished_reason")
+    waiting_by_reason = _labeled_metric_map(raw, "num_requests_waiting_by_reason", "reason")
+
+    # Live scheduler occupancy. These are GAUGES, not counters — they are the only two
+    # numbers here that describe the engine RIGHT NOW rather than a lifetime average, so
+    # they must never be served from a stale cache without saying so.
+    # _parse_prometheus_metrics() already ingests every metric in the payload, so these
+    # were being parsed and discarded before 2026-08-23.
+    requests_running = get_metric("num_requests_running")
+    requests_waiting = get_metric("num_requests_waiting")
+
+    # Tokens actually resident in the pool. usage is a fraction OF THE POOL, not of one
+    # context window — multiplying it by max_model_len (what the context card used to do)
+    # reports a number that is neither.
+    kv_tokens_used = None
+    if gpu_cache_usage is not None and kv_cache_size_tokens:
+        kv_tokens_used = int(round(gpu_cache_usage * kv_cache_size_tokens))
+
+    # Compute live TPS (delta-based).
+    #
+    # ⚠️ THE BASELINE MUST NOT ADVANCE ON EVERY SCRAPE. It used to, and with a 1 s metrics
+    # cache TTL that made the window ~1 s wide — short enough that a window containing no
+    # completed decode step reported a hard 0.0 tok/s while the engine was visibly
+    # generating (observed 2026-08-23: 0.0, 0.0, 48.6 on consecutive polls under steady
+    # load). Hold the baseline until at least VLLM_TPS_MIN_WINDOW_SEC has passed, and serve
+    # the last good value in between, so the card reads steady instead of strobing.
     now = time.time()
     with VLLM_TPS_STATE_LOCK:
         prev_container = VLLM_TPS_STATE.get("container")
         prev_sampled = VLLM_TPS_STATE.get("sampled_at", 0)
         prev_gen = VLLM_TPS_STATE.get("generation_tokens")
+        last_tps = VLLM_TPS_STATE.get("last_tps")
 
         live_tps = None
-        if (prev_container and prev_gen is not None and
+        advance = True
+        if (prev_container == active_key and prev_gen is not None and
                 prev_sampled > 0 and prev_gen <= gen_total):
             dt = now - prev_sampled
-            if dt > 0:
+            if dt >= VLLM_TPS_MIN_WINDOW_SEC:
                 live_tps = (gen_total - prev_gen) / dt
+                VLLM_TPS_STATE["last_tps"] = live_tps
+            else:
+                # Too soon to measure: reuse the last real number and KEEP the baseline.
+                live_tps = last_tps
+                advance = False
 
-        VLLM_TPS_STATE["container"] = active_key
-        VLLM_TPS_STATE["sampled_at"] = now
-        VLLM_TPS_STATE["generation_tokens"] = gen_total
+        if advance:
+            VLLM_TPS_STATE["container"] = active_key
+            VLLM_TPS_STATE["sampled_at"] = now
+            VLLM_TPS_STATE["generation_tokens"] = gen_total
 
     # Compute live ingest TPS.
     # Divide the prompt-token delta by the delta of vLLM's own PREFILL phase time, not by
@@ -1523,10 +1692,18 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
             if d_tokens > 0 and d_prefill and d_prefill > 0:
                 live_ingest_tps = d_tokens / d_prefill
 
-        VLLM_INGEST_STATE["container"] = active_key
-        VLLM_INGEST_STATE["sampled_at"] = now
-        VLLM_INGEST_STATE["prompt_tokens"] = prompt_total
-        VLLM_INGEST_STATE["prefill_seconds"] = prefill_time_sum if prefill_time_count > 0 else None
+        # Same baseline-holding rule as the decode TPS above: a sub-window with no
+        # prefill in it must not overwrite the reference point, or long stretches of pure
+        # decode reset the ingest reading to nothing.
+        if live_ingest_tps is not None:
+            VLLM_INGEST_STATE["last_ingest_tps"] = live_ingest_tps
+        elif (now - prev_ingest_sampled) < VLLM_TPS_MIN_WINDOW_SEC:
+            live_ingest_tps = VLLM_INGEST_STATE.get("last_ingest_tps")
+        if (now - prev_ingest_sampled) >= VLLM_TPS_MIN_WINDOW_SEC or prev_ingest is None:
+            VLLM_INGEST_STATE["container"] = active_key
+            VLLM_INGEST_STATE["sampled_at"] = now
+            VLLM_INGEST_STATE["prompt_tokens"] = prompt_total
+            VLLM_INGEST_STATE["prefill_seconds"] = prefill_time_sum if prefill_time_count > 0 else None
 
     # Averages
     avg_gen_per_request = gen_tokens_sum / gen_tokens_count if gen_tokens_count > 0 else None
@@ -1553,7 +1730,31 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
         "prompt_total": prompt_total,
         "gpu_cache_usage_perc": gpu_cache_usage,
         "kv_cache_size_tokens": kv_cache_size_tokens,
-        "completed_requests": gen_tokens_count,
+        "kv_tokens_used": kv_tokens_used,
+        "kv_max_concurrency": kv_max_concurrency,
+        "requests_running": requests_running,
+        "requests_waiting": requests_waiting,
+        "avg_tpot_sec": avg_tpot_sec,
+        "avg_output_rate_tps": avg_output_rate_tps,
+        "avg_prefill_rate_tps": avg_prefill_rate_tps,
+        "avg_e2e_sec": avg_e2e_sec,
+        "avg_itl_sec": avg_itl_sec,
+        "prefix_hit_rate": prefix_hit_rate,
+        "prefix_queries": prefix_q or None,
+        "external_prefix_hit_rate": ext_hit_rate,
+        "prompt_tokens_cached": prompt_cached or None,
+        "prompt_cached_frac": prompt_cached_frac,
+        "preemptions": preemptions,
+        "spec_present": spec_present,
+        "spec_accept_rate": spec_accept_rate,
+        "spec_accept_len": spec_accept_len,
+        "spec_draft_tokens": spec_draft_tokens if spec_present else None,
+        "offload_read_bytes": offload_read_bytes or None,
+        "offload_store_bytes": offload_store_bytes or None,
+        "offload_cpu_usage_perc": offload_cpu_usage,
+        "success_by_reason": success_by_reason or None,
+        "waiting_by_reason": waiting_by_reason or None,
+        "completed_requests": tpot_count or gen_tokens_count,
     }
 
 
@@ -1949,6 +2150,24 @@ def build_vllm_throughput_status() -> dict:
             "completion_key": f"vllm-reqs:{parsed['completed_requests']}",
             "gpu_cache_usage_perc": parsed["gpu_cache_usage_perc"],
             "kv_cache_size_tokens": parsed["kv_cache_size_tokens"],
+            "kv_tokens_used": parsed["kv_tokens_used"],
+            "kv_max_concurrency": parsed["kv_max_concurrency"],
+            "requests_running": parsed["requests_running"],
+            "requests_waiting": parsed["requests_waiting"],
+            "avg_tpot_sec": parsed["avg_tpot_sec"],
+            "avg_output_rate_tps": parsed["avg_output_rate_tps"],
+            "avg_prefill_rate_tps": parsed["avg_prefill_rate_tps"],
+            "completed_requests": parsed["completed_requests"],
+            # Everything below is vLLM-only detail for the engine panel. Passed through
+            # wholesale so adding a metric means touching parse_vllm_metrics() and the
+            # frontend only — never this dict and the cache replay separately again.
+            **{k: parsed[k] for k in (
+                "avg_e2e_sec", "avg_itl_sec", "prefix_hit_rate", "prefix_queries",
+                "external_prefix_hit_rate", "prompt_tokens_cached", "prompt_cached_frac",
+                "preemptions", "spec_present", "spec_accept_rate", "spec_accept_len",
+                "spec_draft_tokens", "offload_read_bytes", "offload_store_bytes",
+                "offload_cpu_usage_perc", "success_by_reason", "waiting_by_reason",
+            )},
         }
 
     with VLLM_METRICS_CACHE_LOCK:
@@ -1956,61 +2175,73 @@ def build_vllm_throughput_status() -> dict:
         VLLM_METRICS_CACHE["checked_at"] = now
         if code == 0:
             VLLM_METRICS_CACHE["raw"] = output
-            VLLM_METRICS_CACHE["gpu_cache_usage_perc"] = parsed["gpu_cache_usage_perc"]
-            VLLM_METRICS_CACHE["kv_cache_size_tokens"] = parsed["kv_cache_size_tokens"]
-            VLLM_METRICS_CACHE["generation_tokens_total"] = parsed["gen_total"]
-            VLLM_METRICS_CACHE["prompt_tokens_total"] = parsed["prompt_total"]
-            VLLM_METRICS_CACHE["iteration_tokens_total_sum"] = parsed["avg_iter_tokens"] * parsed["total_requests_approx"] if parsed["avg_iter_tokens"] else 0
-            # Note: I should probably just store the parsed dict or more fields if needed, 
-            # but for now let's just make sure _build_vllm_throughput_from_cache works.
+            # ⭐ STORE THE WHOLE RESULT, NOT A HAND-PICKED SUBSET.
+            # Until 2026-08-23 this wrote 5 keys while _build_vllm_throughput_from_cache()
+            # read 12, so every cached read returned None for avg TTFT, avg queue time, avg
+            # tokens per request AND reported total_requests_approx = 0. With a 1 s TTL and
+            # two builder calls per /api/status poll, the cached path is the COMMON path, so
+            # the dashboard showed those fields as empty essentially always. The original
+            # code even said so in a comment ("I should probably just store the parsed
+            # dict"). This is that fix — do not go back to enumerating fields here.
+            VLLM_METRICS_CACHE["result"] = result
         else:
             VLLM_METRICS_CACHE["raw"] = None
+            VLLM_METRICS_CACHE["result"] = None
 
     return result
 
 
 def _build_vllm_throughput_from_cache(container: str) -> dict:
-    """Build vLLM throughput result from cached metrics."""
+    """Replay the last live scrape's result.
+
+    Every field is served verbatim from the stored result, so a cached read and a live read
+    are indistinguishable except for `state`. See the STORE THE WHOLE RESULT note above for
+    why this is not a field-by-field rebuild any more.
+
+    Two things are deliberately NOT replayed:
+      * `requests_running` / `requests_waiting` are GAUGES describing the engine right now.
+        Replaying a value up to VLLM_METRICS_CACHE_TTL_SEC old is fine for a rate or a
+        lifetime average, but a stale "3 streams running" is a lie about the present, so
+        the freshness of the reading is published alongside it as `gauge_age_sec` and the
+        frontend can decide.
+      * `state`, which becomes "cached" so callers can tell.
+    """
     cache = VLLM_METRICS_CACHE
-    gen_total = cache.get("generation_tokens_total", 0)
-    prompt_total = cache.get("prompt_tokens_total", 0)
-    iter_sum = cache.get("iteration_tokens_total_sum", 0)
-    iter_count = cache.get("iteration_tokens_total_count", 0)
-    queue_sum = cache.get("request_queue_time_seconds_sum", 0)
-    queue_count = cache.get("request_queue_time_seconds_count", 0)
-    ttft_sum = cache.get("time_to_first_token_seconds_sum", 0)
-    ttft_count = cache.get("time_to_first_token_seconds_count", 0)
-    gen_tokens_sum = cache.get("request_generation_tokens_sum", 0)
-    gen_tokens_count = cache.get("request_generation_tokens_count", 0)
-    prompt_tokens_sum = cache.get("request_prompt_tokens_sum", 0)
-    prompt_tokens_count = cache.get("request_prompt_tokens_count", 0)
+    stored = cache.get("result")
+    if not stored:
+        # No successful scrape yet on this container. Say so rather than inventing zeroes:
+        # a 0 here is indistinguishable from a genuinely idle engine.
+        return {
+            "tokens_per_second": None,
+            "ingest_tps": None,
+            "source": "prometheus",
+            "updated_at": now_iso(),
+            "container": container,
+            "state": "collecting",
+            "detail": "No vLLM metrics scraped yet",
+            "generation_tokens_total": 0,
+            "prompt_tokens_total": 0,
+            "avg_queue_time_sec": None,
+            "avg_ttft_sec": None,
+            "avg_iter_tokens": None,
+            "avg_gen_per_request": None,
+            "avg_prompt_per_request": None,
+            "total_requests_approx": 0,
+            "gpu_cache_usage_perc": None,
+            "kv_cache_size_tokens": None,
+            "kv_tokens_used": None,
+            "kv_max_concurrency": None,
+            "requests_running": None,
+            "requests_waiting": None,
+        }
 
-    avg_gen_per_request = gen_tokens_sum / gen_tokens_count if gen_tokens_count > 0 else None
-    avg_prompt_per_request = prompt_tokens_sum / prompt_tokens_count if prompt_tokens_count > 0 else None
-    avg_queue_time = queue_sum / queue_count if queue_count > 0 else None
-    avg_ttft = ttft_sum / ttft_count if ttft_count > 0 else None
-    avg_iter_tokens = iter_sum / iter_count if iter_count > 0 else None
-
-    return {
-        "tokens_per_second": None,  # TPS only available on live scrape
-        "ingest_tps": None,
-        "source": "prometheus",
-        "updated_at": now_iso(),
-        "container": container,
-        "state": "cached",
-        "detail": "Cached vLLM Prometheus metrics",
-        "generation_tokens_total": gen_total,
-        "prompt_tokens_total": prompt_total,
-        "avg_queue_time_sec": avg_queue_time,
-        "avg_ttft_sec": avg_ttft,
-        "avg_iter_tokens": avg_iter_tokens,
-        "avg_gen_per_request": avg_gen_per_request,
-        "avg_prompt_per_request": avg_prompt_per_request,
-        "total_requests_approx": max(iter_count, queue_count, gen_tokens_count),
-        "completion_key": f"vllm-reqs:{gen_tokens_count}",
-        "gpu_cache_usage_perc": cache.get("gpu_cache_usage_perc"),
-        "kv_cache_size_tokens": cache.get("kv_cache_size_tokens"),
-    }
+    result = dict(stored)
+    result["state"] = "cached"
+    result["detail"] = "Cached vLLM Prometheus metrics"
+    result["updated_at"] = now_iso()
+    result["container"] = container
+    result["gauge_age_sec"] = max(0.0, time.time() - cache.get("checked_at", 0.0))
+    return result
 
 
 def build_model_stats(active_key: str | None, live: dict, completed: dict) -> dict:
@@ -3402,6 +3633,7 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
         m = models[active_key]
         active = {
             "key": active_key,
+            "max_seqs": m.get("max_seqs", ""),
             "label": m["label"],
             "compose": m["compose"],
             "healthy": active_healthy,
@@ -3415,6 +3647,34 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
     throughput = build_throughput_status(active_key, containers)
     live_throughput = build_live_throughput_status(active_key, containers)
     model_stats = build_model_stats(active_key, live_throughput, throughput)
+    if _key_is_vllm(active_key):
+        # ⭐ vLLM KEEPS ITS OWN LIFETIME AVERAGES — USE THEM.
+        # build_model_stats() accumulates "average rate" and "completed runs" the llama.cpp
+        # way: it watches a completion key change and averages the instantaneous delta-TPS
+        # reading it happened to hold at that moment. On vLLM that produced a number frozen
+        # for hours (17.39 tok/s observed 2026-08-23 while the engine served 44-49) and a
+        # run count unrelated to actual requests. vLLM publishes request_time_per_output_
+        # token_seconds and the request histograms, which are exact. Prefer them, and fall
+        # back to the accumulated values only where vLLM has nothing yet.
+        vllm_rate = throughput.get("avg_output_rate_tps")
+        if vllm_rate is not None:
+            model_stats["average_rate_tps"] = vllm_rate
+        vllm_done = throughput.get("completed_requests")
+        if vllm_done:
+            model_stats["completed_count"] = int(vllm_done)
+        if throughput.get("avg_prefill_rate_tps") is not None:
+            model_stats["avg_prefill_rate_tps"] = throughput["avg_prefill_rate_tps"]
+        # Surface the scheduler gauges and pool figures where the frontend already looks.
+        for _k in ("requests_running", "requests_waiting", "avg_ttft_sec",
+                   "avg_queue_time_sec", "avg_tpot_sec", "kv_max_concurrency",
+                   "avg_e2e_sec", "avg_itl_sec", "avg_iter_tokens", "avg_gen_per_request",
+                   "avg_prompt_per_request", "prefix_hit_rate", "external_prefix_hit_rate",
+                   "prompt_cached_frac", "preemptions", "spec_present", "spec_accept_rate",
+                   "spec_accept_len", "offload_read_bytes", "offload_store_bytes",
+                   "offload_cpu_usage_perc", "success_by_reason", "waiting_by_reason",
+                   "kv_tokens_used", "kv_cache_size_tokens", "generation_tokens_total",
+                   "prompt_tokens_total", "total_requests_approx", "state", "gauge_age_sec"):
+            model_stats[_k] = throughput.get(_k)
     # Hand the freshly-measured throughput to the metrics sampler so it never has to
     # run its own docker exec to get the same numbers.
     note_live_throughput(
@@ -3430,13 +3690,35 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
             context_info["n_ctx"] = ctx_size
             usage = throughput.get("gpu_cache_usage_perc")
             kv_tokens = throughput.get("kv_cache_size_tokens")
-            if usage is not None and kv_tokens:
-                # Scale by real KV-cache capacity, not by ctx_size: the cache holds far more
-                # tokens than one context window (304k vs 147k here), so multiplying the
-                # usage fraction by ctx_size understates what is resident. Report tokens.
-                context_info["n_past"] = min(ctx_size, int(round(usage * kv_tokens)))
-            elif usage is not None:
-                context_info["n_past"] = int(round(ctx_size * usage))
+
+            # ⚠️ POOL RESIDENCY IS NOT CONTEXT-WINDOW USAGE, AND THIS USED TO CONFLATE THEM.
+            # `usage` is a fraction OF THE WHOLE KV POOL, which on this box holds 383,434
+            # tokens spread over up to 16 concurrent requests — more than one 262,144-token
+            # window. The old code did min(ctx_size, usage * kv_tokens) and labelled the
+            # result "% of window", so a healthy multi-request pool at 40% read as a single
+            # request 104k tokens into its context. Observed climbing 41k -> 104k under
+            # ordinary concurrent traffic 2026-08-23.
+            #
+            # Publish the two as SEPARATE facts:
+            #   pool_*  = what the pool holds right now, out of its real capacity
+            #   n_past  = a per-request figure, which vLLM does NOT expose as a gauge; the
+            #             honest stand-in is its own average prompt+generation per request.
+            context_info["pool_tokens"] = kv_tokens
+            context_info["pool_used"] = throughput.get("kv_tokens_used")
+            context_info["pool_usage_perc"] = usage
+            context_info["pool_max_concurrency"] = throughput.get("kv_max_concurrency")
+            context_info["requests_running"] = throughput.get("requests_running")
+            context_info["requests_waiting"] = throughput.get("requests_waiting")
+
+            avg_prompt = throughput.get("avg_prompt_per_request")
+            avg_gen = throughput.get("avg_gen_per_request")
+            if avg_prompt is not None:
+                context_info["n_past"] = min(ctx_size, int(round(avg_prompt + (avg_gen or 0))))
+                context_info["n_past_is_average"] = True
+            else:
+                # No completed request yet on this boot — leave it unknown rather than
+                # substituting a pool number that means something else.
+                context_info["n_past"] = None
         except (ValueError, KeyError):
             pass
 
@@ -3858,7 +4140,12 @@ INDEX_HTML = r"""<!doctype html>
     /* ── Quick stats ── */
     .stats-row {
       display: grid;
-      grid-template-columns: repeat(6, 1fr);
+      /* 6 cards on llama.cpp, 9 on vLLM (KV Pool, Streams and Prefix Cache are vLLM-only).
+         auto-fit + minmax covers both without a second set of breakpoints. The floor is
+         142px, not 165px: at 165px a 1488px row fits exactly 8 columns, which left the
+         ninth vLLM card orphaned on a second line. 9 x 142 + 8 x 14 gap = 1390px, so all
+         nine sit on one line at this width and still wrap cleanly on narrower screens. */
+      grid-template-columns: repeat(auto-fit, minmax(142px, 1fr));
       gap: 14px;
     }
     .stat-card {
@@ -4448,6 +4735,18 @@ INDEX_HTML = r"""<!doctype html>
     .sc-util   { --sc: #f5a524; }
     .sc-vram   { --sc: #2ed3c6; }
     .sc-temp   { --sc: #f2555a; }
+    .sc-pool    { --sc: #7c8cf8; }
+    .sc-streams { --sc: #f77fb5; }
+    .sc-cache   { --sc: #34c3e8; }
+    /* vLLM engine panel: dense two-column readouts, same visual weight as info-pair. */
+    .eng-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; }
+    .eng-item { min-width: 0; }
+    .eng-label { font-size: 10px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.4px; }
+    .eng-value { font-size: 12.5px; font-weight: 600; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .eng-value.warn { color: #f5a524; }
+    .eng-value.bad  { color: #f2555a; }
+    .eng-value.good { color: #21c98a; }
+    .eng-note { font-size: 10.5px; color: var(--text-muted); line-height: 1.4; margin-top: 2px; }
     /* A faint wash in the card's own colour, strongest at the lit top edge. */
     .stat-card {
       background:
@@ -4704,13 +5003,13 @@ INDEX_HTML = r"""<!doctype html>
         <div class="stat-card sc-gen">
           <div class="stat-label">Generation Speed</div>
           <div class="stat-value" id="val-tps">--</div>
-          <div class="stat-sub">tokens / sec</div>
+          <div class="stat-sub" id="val-tps-sub">tokens / sec</div>
           <div class="stat-spark" id="spark-tps"></div>
         </div>
         <div class="stat-card sc-ingest">
           <div class="stat-label">Ingest Speed</div>
           <div class="stat-value" id="val-ingest">--</div>
-          <div class="stat-sub">tokens / sec</div>
+          <div class="stat-sub" id="val-ingest-sub">tokens / sec</div>
           <div class="stat-spark" id="spark-ingest"></div>
         </div>
         <div class="stat-card sc-ctx" id="stat-ctx-card">
@@ -4718,6 +5017,24 @@ INDEX_HTML = r"""<!doctype html>
           <div class="stat-value" id="val-ctx">-- / --</div>
           <div class="stat-sub" id="val-ctx-sub">window used</div>
           <div class="stat-bar-bg"><div id="bar-ctx" class="stat-bar-fill" style="width:0%"></div></div>
+        </div>
+        <div class="stat-card sc-pool" id="stat-pool-card" hidden>
+          <div class="stat-label">KV Pool</div>
+          <div class="stat-value" id="val-pool">-- / --</div>
+          <div class="stat-sub" id="val-pool-sub">tokens resident</div>
+          <div class="stat-bar-bg"><div id="bar-pool" class="stat-bar-fill" style="width:0%"></div></div>
+        </div>
+        <div class="stat-card sc-streams" id="stat-streams-card" hidden>
+          <div class="stat-label">Streams</div>
+          <div class="stat-value" id="val-streams">--</div>
+          <div class="stat-sub" id="val-streams-sub">concurrent requests</div>
+          <div class="stat-bar-bg"><div id="bar-streams" class="stat-bar-fill" style="width:0%"></div></div>
+        </div>
+        <div class="stat-card sc-cache" id="stat-cache-card" hidden>
+          <div class="stat-label">Prefix Cache</div>
+          <div class="stat-value" id="val-cache">--%</div>
+          <div class="stat-sub" id="val-cache-sub">prompt tokens reused</div>
+          <div class="stat-bar-bg"><div id="bar-cache" class="stat-bar-fill" style="width:0%"></div></div>
         </div>
         <div class="stat-card sc-util">
           <div class="stat-label">GPU Utilization</div>
@@ -4786,11 +5103,11 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <div class="info-pair">
               <div class="info-item">
-                <div class="info-label">Avg Rate</div>
+                <div class="info-label" id="info-avg-rate-label">Avg Rate</div>
                 <div class="info-value" id="info-avg-rate">-- T/S</div>
               </div>
               <div class="info-item">
-                <div class="info-label">Completed Runs</div>
+                <div class="info-label" id="info-runs-label">Completed Runs</div>
                 <div class="info-value" id="info-runs">0</div>
               </div>
             </div>
@@ -4804,6 +5121,26 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="info-value" id="info-power">--W / --W</div>
               </div>
             </div>
+            <div id="engine-panel" hidden>
+              <div class="details-bench-sep"></div>
+              <div class="section-title">vLLM Engine</div>
+              <div class="eng-grid">
+                <div class="eng-item"><div class="eng-label">TTFT avg</div><div class="eng-value" id="eng-ttft">--</div></div>
+                <div class="eng-item"><div class="eng-label">Queue wait avg</div><div class="eng-value" id="eng-queue">--</div></div>
+                <div class="eng-item"><div class="eng-label">Inter-token</div><div class="eng-value" id="eng-itl">--</div></div>
+                <div class="eng-item"><div class="eng-label">E2E latency avg</div><div class="eng-value" id="eng-e2e">--</div></div>
+                <div class="eng-item"><div class="eng-label">Batch (tok/step)</div><div class="eng-value" id="eng-batch">--</div></div>
+                <div class="eng-item"><div class="eng-label">Preemptions</div><div class="eng-value" id="eng-preempt">--</div></div>
+                <div class="eng-item"><div class="eng-label">Avg prompt</div><div class="eng-value" id="eng-avgprompt">--</div></div>
+                <div class="eng-item"><div class="eng-label">Avg generated</div><div class="eng-value" id="eng-avggen">--</div></div>
+                <div class="eng-item"><div class="eng-label">Cache: GPU / host</div><div class="eng-value" id="eng-cachetiers">--</div></div>
+                <div class="eng-item"><div class="eng-label">Spec decode</div><div class="eng-value" id="eng-spec">--</div></div>
+                <div class="eng-item"><div class="eng-label">KV offload r/w</div><div class="eng-value" id="eng-offload">--</div></div>
+                <div class="eng-item"><div class="eng-label">Finish reasons</div><div class="eng-value" id="eng-finish">--</div></div>
+              </div>
+              <div class="eng-note" id="eng-note"></div>
+            </div>
+
             <div class="details-bench-sep"></div>
 
             <div class="section-title">Benchmark</div>
@@ -5396,8 +5733,54 @@ INDEX_HTML = r"""<!doctype html>
         ingestVal = liveIngest.toFixed(1);
       }
 
+      // ⚠️ vLLM HAS NO llama.cpp-STYLE INGEST READING. last_ingest_tps / best_ingest_tps
+      // are filled by the llama.cpp log watcher and INGEST_LIVE_STATE, which never see a
+      // vLLM container, so this card read a flat 0.0 on every vLLM stack. The live
+      // prompt-token delta only produces a value when a poll window happens to contain a
+      // prefill, so fall back to vLLM's own lifetime mean (prompt tokens / prefill seconds).
+      const isVllmStack = (data.active?.family === 'vllm');
+      let ingestIsAvg = false;
+      if (isVllmStack && (ingestVal === '0.0' || ingestVal === '--')) {
+        const liveIng = live?.ingest_tps ?? stats.ingest_tps;
+        if (liveIng != null && liveIng > 0) {
+          ingestVal = liveIng.toFixed(1);
+        } else if (stats.avg_prefill_rate_tps != null && stats.avg_prefill_rate_tps > 0) {
+          ingestVal = stats.avg_prefill_rate_tps.toFixed(0);
+          ingestIsAvg = true;
+        }
+      }
+
       document.getElementById('val-tps').textContent = genDisplay;
       document.getElementById('val-ingest').textContent = ingestVal;
+      const tpsSubEl = document.getElementById('val-tps-sub');
+      if (tpsSubEl) {
+        // average_rate_tps on vLLM is count/sum of request_time_per_output_token_seconds —
+        // the true mean output rate over completed requests, not an average of samples.
+        let tpsSub = 'tokens / sec';
+        if (isVllmStack) {
+          const avgTxt = stats.average_rate_tps ? `tok/s · avg ${stats.average_rate_tps.toFixed(1)}` : 'tokens / sec';
+          // ⚠️ 0 tok/s WITH A REQUEST RUNNING IS NOT AN IDLE ENGINE — it is a request in its
+          // PREFILL phase, which emits no output tokens while pinning the GPU. Observed at
+          // 95% GPU utilisation with 1 stream running and an 8.3k-token average prompt.
+          // Reading that card as "the model stopped" is exactly the wrong conclusion.
+          if (liveTps < 0.5 && stats.requests_running > 0) {
+            tpsSub = `prefilling · ${avgTxt}`;
+          } else if (liveTps < 0.5 && !stats.requests_running) {
+            tpsSub = `idle · ${avgTxt}`;
+          } else {
+            tpsSub = avgTxt;
+          }
+        }
+        tpsSubEl.textContent = tpsSub;
+      }
+      const ingSubEl = document.getElementById('val-ingest-sub');
+      if (ingSubEl) {
+        // Say EFFECTIVE, not raw: prompt_tokens_total counts prefix-cache hits, which cost
+        // almost no prefill time, so this mean is inflated far above cold prefill (measured
+        // ~1,100-1,250 tok/s cold on this box vs ~5,000 effective). Do not read it as raw
+        // prefill bandwidth.
+        ingSubEl.textContent = ingestIsAvg ? 'tok/s · effective avg (incl. cache hits)' : 'tokens / sec';
+      }
       document.getElementById('val-util').textContent = gpu.util != null ? `${gpu.util}%` : '--%';
       document.getElementById('bar-util').style.width = `${gpu.util || 0}%`;
       const vramGB = ((gpu.mem_used || 0) / 1024).toFixed(1);
@@ -5421,8 +5804,17 @@ INDEX_HTML = r"""<!doctype html>
       const ctxEl = document.getElementById('val-ctx');
       const ctxBar = document.getElementById('bar-ctx');
       const ctxSub = document.getElementById('val-ctx-sub');
-      if (nCtx != null) {
-        ctxSub.textContent = (nPast > 0) ? `${((nPast / nCtx) * 100).toFixed(1)}% of window` : 'window idle';
+      // ⚠️ For vLLM, n_past is the AVERAGE prompt+generation per request, because vLLM
+      // publishes no per-request context gauge. Saying "% of window" about an average, or
+      // about the old pool-derived number, was the misleading part. Label what it is.
+      const ctxIsAvg = ctxInfo.n_past_is_average === true;
+      const ctxLabelEl = document.getElementById('stat-ctx-label');
+      if (ctxLabelEl) ctxLabelEl.textContent = ctxIsAvg ? 'Context / request' : 'Context';
+      if (nCtx != null && nPast > 0) {
+        const share = `${((nPast / nCtx) * 100).toFixed(1)}% of window`;
+        ctxSub.textContent = ctxIsAvg ? `avg per request · ${share}` : share;
+      } else if (nCtx != null) {
+        ctxSub.textContent = ctxIsAvg ? 'no completed requests yet' : 'window idle';
       } else {
         ctxSub.textContent = 'window used';
       }
@@ -5446,6 +5838,139 @@ INDEX_HTML = r"""<!doctype html>
       } else {
         ctxEl.textContent = '-- / --';
         ctxBar.style.width = '0%';
+      }
+
+      // ── vLLM-only cards and engine panel ────────────────────────────────────────
+      // Everything here is driven by model_stats, which build_status() fills from the
+      // engine's own Prometheus metrics when the active stack is vLLM. For llama.cpp the
+      // fields are absent, so the cards stay hidden rather than rendering zeroes.
+      const isVllm = (data.active?.family === 'vllm');
+      const fmtTok = (n) => n == null ? '--'
+        : (n >= 1000 ? `${(n/1000).toFixed(n >= 100000 ? 0 : 1)}k` : `${Math.round(n)}`);
+      const fmtSec = (v) => v == null ? '--'
+        : (v < 1 ? `${(v*1000).toFixed(v < 0.1 ? 1 : 0)} ms` : `${v.toFixed(v < 10 ? 2 : 1)} s`);
+      const fmtGB  = (b) => b == null ? '--' : `${(b/1073741824).toFixed(1)} GB`;
+      const pct1   = (f) => f == null ? '--' : `${(f*100).toFixed(1)}%`;
+
+      const poolCard = document.getElementById('stat-pool-card');
+      const streamCard = document.getElementById('stat-streams-card');
+      const cacheCard = document.getElementById('stat-cache-card');
+      const engPanel = document.getElementById('engine-panel');
+      poolCard.hidden = !isVllm; streamCard.hidden = !isVllm;
+      cacheCard.hidden = !isVllm; engPanel.hidden = !isVllm;
+
+      if (isVllm) {
+        // KV Pool — tokens actually resident out of real pool capacity. NOT context-window
+        // usage: the pool spans every concurrent request, so this and the Context card
+        // measure different things on purpose.
+        const poolUsed = ctxInfo.pool_used, poolTot = ctxInfo.pool_tokens;
+        const poolPct = (poolUsed != null && poolTot) ? (poolUsed/poolTot)*100 : 0;
+        document.getElementById('val-pool').textContent =
+          (poolUsed != null && poolTot) ? `${fmtTok(poolUsed)} / ${fmtTok(poolTot)}` : '-- / --';
+        const conc = ctxInfo.pool_max_concurrency;
+        document.getElementById('val-pool-sub').textContent =
+          (poolUsed != null && poolTot)
+            ? `${poolPct.toFixed(1)}% resident${conc ? ` · ${conc.toFixed(2)}x capacity` : ''}`
+            : 'tokens resident';
+        document.getElementById('bar-pool').style.width = `${Math.min(100, poolPct).toFixed(1)}%`;
+        if (poolPct > 90) poolCard.style.setProperty('--sc', '#f2555a');
+        else if (poolPct > 75) poolCard.style.setProperty('--sc', '#f5a524');
+        else poolCard.style.removeProperty('--sc');
+
+        // Streams — running now, out of the slot cap from the stack's LLM_META max_seqs.
+        // Queue depth matters more than the running count on this box: capacity-waiting
+        // with free slots means the prefill token budget is the bottleneck, not the slots.
+        const run = stats.requests_running, wait = stats.requests_waiting;
+        const maxSeqs = parseInt(data.active?.max_seqs || '0', 10) || null;
+        document.getElementById('val-streams').textContent =
+          run == null ? '--' : (maxSeqs ? `${Math.round(run)} / ${maxSeqs}` : `${Math.round(run)}`);
+        const wr = stats.waiting_by_reason || {};
+        let waitTxt = 'concurrent requests';
+        if (wait != null && wait > 0) {
+          const why = (wr.capacity > 0 && wr.deferred > 0) ? 'capacity + deferred'
+                    : (wr.capacity > 0 ? 'waiting on capacity'
+                    : (wr.deferred > 0 ? 'deferred' : 'queued'));
+          waitTxt = `${Math.round(wait)} ${why}`;
+        } else if (run != null) {
+          waitTxt = run > 0 ? 'no queue' : 'idle';
+        }
+        document.getElementById('val-streams-sub').textContent = waitTxt;
+        const sPct = (run != null && maxSeqs) ? Math.min(100, (run/maxSeqs)*100) : 0;
+        document.getElementById('bar-streams').style.width = `${sPct.toFixed(1)}%`;
+        if (wait > 0) streamCard.style.setProperty('--sc', '#f5a524');
+        else streamCard.style.removeProperty('--sc');
+
+        // Prefix Cache — headline is the share of PROMPT TOKENS served from cache, which is
+        // the saving in the unit that matters. Hit-rate percentages of the two tiers go in
+        // the sub-line; a hit on a tiny block and a hit on 100k tokens count the same there.
+        const frac = stats.prompt_cached_frac;
+        document.getElementById('val-cache').textContent = frac == null ? '--%' : pct1(frac);
+        document.getElementById('val-cache-sub').textContent =
+          (stats.prefix_hit_rate == null && stats.external_prefix_hit_rate == null)
+            ? 'prompt tokens reused'
+            : `GPU ${pct1(stats.prefix_hit_rate)} · host ${pct1(stats.external_prefix_hit_rate)}`;
+        document.getElementById('bar-cache').style.width =
+          `${frac == null ? 0 : Math.min(100, frac*100).toFixed(1)}%`;
+
+        // ── engine panel ──
+        const ttft = stats.avg_ttft_sec, queue = stats.avg_queue_time_sec;
+        const ttftEl = document.getElementById('eng-ttft');
+        ttftEl.textContent = fmtSec(ttft);
+        ttftEl.className = 'eng-value' + (ttft == null ? '' : (ttft > 10 ? ' bad' : (ttft > 3 ? ' warn' : ' good')));
+        const qEl = document.getElementById('eng-queue');
+        qEl.textContent = fmtSec(queue);
+        // Queue as a share of TTFT is the actionable number: if most of the wait is queue,
+        // the fix is scheduling/token budget, not model or quantisation.
+        const qShare = (ttft && queue != null && ttft > 0) ? queue/ttft : null;
+        qEl.className = 'eng-value' + (qShare == null ? '' : (qShare > 0.5 ? ' bad' : (qShare > 0.2 ? ' warn' : ' good')));
+        document.getElementById('eng-itl').textContent = fmtSec(stats.avg_itl_sec ?? stats.avg_tpot_sec);
+        document.getElementById('eng-e2e').textContent = fmtSec(stats.avg_e2e_sec);
+        document.getElementById('eng-batch').textContent =
+          stats.avg_iter_tokens == null ? '--' : stats.avg_iter_tokens.toFixed(1);
+        const pre = stats.preemptions;
+        const preEl = document.getElementById('eng-preempt');
+        preEl.textContent = pre == null ? '--' : Math.round(pre).toLocaleString();
+        preEl.className = 'eng-value' + (pre == null ? '' : (pre > 0 ? ' warn' : ' good'));
+        document.getElementById('eng-avgprompt').textContent = fmtTok(stats.avg_prompt_per_request) + ' tok';
+        document.getElementById('eng-avggen').textContent = fmtTok(stats.avg_gen_per_request) + ' tok';
+        document.getElementById('eng-cachetiers').textContent =
+          `${pct1(stats.prefix_hit_rate)} / ${pct1(stats.external_prefix_hit_rate)}`;
+
+        // Spec decode: "off" and "on but accepting nothing" are completely different
+        // situations and must never render identically. spec_present is false when the
+        // engine was started without --speculative-config at all.
+        const specEl = document.getElementById('eng-spec');
+        if (!stats.spec_present) {
+          specEl.textContent = 'off';
+          specEl.className = 'eng-value';
+        } else {
+          const ar = stats.spec_accept_rate, al = stats.spec_accept_len;
+          specEl.textContent = ar == null ? 'on' :
+            `${pct1(ar)} accept${al ? ` · ${al.toFixed(2)}x` : ''}`;
+          // 0% acceptance means the drafter burns a forward pass per position for nothing.
+          specEl.className = 'eng-value' + (ar == null ? '' : (ar < 0.05 ? ' bad' : (ar < 0.2 ? ' warn' : ' good')));
+        }
+        document.getElementById('eng-offload').textContent =
+          (stats.offload_read_bytes == null && stats.offload_store_bytes == null) ? '--'
+          : `${fmtGB(stats.offload_read_bytes)} / ${fmtGB(stats.offload_store_bytes)}`;
+        const sbr = stats.success_by_reason || {};
+        const finish = Object.entries(sbr).filter(([, v]) => v > 0)
+          .sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${Math.round(v)}`).join(' · ');
+        document.getElementById('eng-finish').textContent = finish || '--';
+
+        // One plain-language line naming the current bottleneck, if there is one.
+        const notes = [];
+        if (wait > 0 && wr.capacity > 0 && maxSeqs && run != null && run < maxSeqs) {
+          notes.push(`${Math.round(wait)} request(s) waiting on capacity with ${maxSeqs - Math.round(run)} slot(s) free — the prefill token budget is the limit, not max_num_seqs.`);
+        }
+        if (qShare != null && qShare > 0.5) {
+          notes.push(`${pct1(qShare)} of TTFT is queue wait.`);
+        }
+        if (pre > 0) notes.push(`${Math.round(pre)} preemption(s): the KV pool is being exhausted.`);
+        if (stats.spec_present && stats.spec_accept_rate != null && stats.spec_accept_rate < 0.05) {
+          notes.push('Speculative decoding is accepting ~nothing — it is pure overhead right now.');
+        }
+        document.getElementById('eng-note').textContent = notes.join(' ');
       }
 
       // History chart
@@ -5479,8 +6004,17 @@ INDEX_HTML = r"""<!doctype html>
 
       if (data.active) {
         infoModel.textContent = data.active.label;
+        // On vLLM these two are exact engine figures, not accumulated samples — rename them
+        // so nobody reads "Avg Rate" as the llama.cpp average-of-completed-runs it used to be.
+        const rateLabel = document.getElementById('info-avg-rate-label');
+        const runsLabel = document.getElementById('info-runs-label');
+        if (rateLabel) rateLabel.textContent = (data.active.family === 'vllm') ? 'Avg Output Rate' : 'Avg Rate';
+        if (runsLabel) runsLabel.textContent = (data.active.family === 'vllm') ? 'Requests Served' : 'Completed Runs';
         let badges = '';
         if (data.active.params) badges += `<span class="badge badge-ctx">${escHtml(data.active.params)}</span>`;
+        if (data.active.family === 'vllm' && data.active.max_seqs) {
+          badges += `<span class="badge badge-ctx">${escHtml(data.active.max_seqs)} slots</span>`;
+        }
         if (data.active.ctx_size) {
           const ctx = parseInt(data.active.ctx_size);
           const ctxLabel = ctx >= 1024 ? `${Math.round(ctx/1024)}k ctx` : `${ctx} ctx`;

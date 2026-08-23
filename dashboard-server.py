@@ -5127,7 +5127,7 @@ INDEX_HTML = r"""<!doctype html>
               <div class="eng-grid">
                 <div class="eng-item"><div class="eng-label">TTFT avg</div><div class="eng-value" id="eng-ttft">--</div></div>
                 <div class="eng-item"><div class="eng-label">Queue wait avg</div><div class="eng-value" id="eng-queue">--</div></div>
-                <div class="eng-item"><div class="eng-label">Inter-token</div><div class="eng-value" id="eng-itl">--</div></div>
+                <div class="eng-item"><div class="eng-label">Inter-token / req</div><div class="eng-value" id="eng-itl">--</div></div>
                 <div class="eng-item"><div class="eng-label">E2E latency avg</div><div class="eng-value" id="eng-e2e">--</div></div>
                 <div class="eng-item"><div class="eng-label">Batch (tok/step)</div><div class="eng-value" id="eng-batch">--</div></div>
                 <div class="eng-item"><div class="eng-label">Preemptions</div><div class="eng-value" id="eng-preempt">--</div></div>
@@ -5758,18 +5758,31 @@ INDEX_HTML = r"""<!doctype html>
         // the true mean output rate over completed requests, not an average of samples.
         let tpsSub = 'tokens / sec';
         if (isVllmStack) {
-          const avgTxt = stats.average_rate_tps ? `tok/s · avg ${stats.average_rate_tps.toFixed(1)}` : 'tokens / sec';
+          // ⚠️ THESE ARE DIFFERENT UNITS AND MUST SAY SO.
+          // val-tps is AGGREGATE across every running stream (delta of
+          // generation_tokens_total). average_rate_tps is PER REQUEST (1 / mean
+          // request_time_per_output_token_seconds). With 3 concurrent streams the first
+          // reads ~95 tok/s and the second ~24 - both correct, 3 x 24 ~ 72-95. Shown
+          // side by side unlabelled, the pair reads as "generation is crawling", which is
+          // what prompted this fix. MEASURED 2026-08-23: one request alone gets 44.9 tok/s,
+          // 35.8-36.2 with one other running, 13.4 with two others. Per-stream rate falling
+          // as streams are added while aggregate rises is normal, not a regression.
+          const runNow = stats.requests_running || 0;
+          const perStream = (liveTps > 0 && runNow > 1) ? (liveTps / runNow) : null;
+          // Build ONE trailing clause, never a chain: prefixing a state word onto a string
+          // that already began with "tok/s ·" produced "idle · tok/s · 25.0 per request avg".
+          const avgTxt = stats.average_rate_tps
+            ? (perStream
+                ? `${perStream.toFixed(1)}/stream now`
+                : `${stats.average_rate_tps.toFixed(1)}/req avg`)
+            : null;
           // ⚠️ 0 tok/s WITH A REQUEST RUNNING IS NOT AN IDLE ENGINE — it is a request in its
           // PREFILL phase, which emits no output tokens while pinning the GPU. Observed at
           // 95% GPU utilisation with 1 stream running and an 8.3k-token average prompt.
           // Reading that card as "the model stopped" is exactly the wrong conclusion.
-          if (liveTps < 0.5 && stats.requests_running > 0) {
-            tpsSub = `prefilling · ${avgTxt}`;
-          } else if (liveTps < 0.5 && !stats.requests_running) {
-            tpsSub = `idle · ${avgTxt}`;
-          } else {
-            tpsSub = avgTxt;
-          }
+          const state = (liveTps >= 0.5) ? 'tok/s aggregate'
+                      : (stats.requests_running > 0 ? 'prefilling' : 'idle');
+          tpsSub = avgTxt ? `${state} · ${avgTxt}` : (liveTps >= 0.5 ? 'tokens / sec' : state);
         }
         tpsSubEl.textContent = tpsSub;
       }
@@ -6008,7 +6021,8 @@ INDEX_HTML = r"""<!doctype html>
         // so nobody reads "Avg Rate" as the llama.cpp average-of-completed-runs it used to be.
         const rateLabel = document.getElementById('info-avg-rate-label');
         const runsLabel = document.getElementById('info-runs-label');
-        if (rateLabel) rateLabel.textContent = (data.active.family === 'vllm') ? 'Avg Output Rate' : 'Avg Rate';
+        // Name the unit: this is a PER-REQUEST mean, not the aggregate on the speed card.
+        if (rateLabel) rateLabel.textContent = (data.active.family === 'vllm') ? 'Avg Rate / Request' : 'Avg Rate';
         if (runsLabel) runsLabel.textContent = (data.active.family === 'vllm') ? 'Requests Served' : 'Completed Runs';
         let badges = '';
         if (data.active.params) badges += `<span class="badge badge-ctx">${escHtml(data.active.params)}</span>`;

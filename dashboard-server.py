@@ -1205,9 +1205,17 @@ def list_llama_compose_containers() -> list[dict]:
                     })
             continue
 
-        # Check if this is a vLLM container
+        # Check if this is a vLLM container. vLLM stacks may use their own service
+        # name, so recognize every discovered vLLM stack rather than only the
+        # legacy default VLLM_SERVER_SERVICE.
         if working_dir.rstrip("/") == VLLM_WORKING_DIR_LABEL.rstrip("/"):
-            if service.strip().lower() == VLLM_SERVER_SERVICE.lower():
+            all_models, _ = get_models()
+            vllm_services = {
+                VLLM_SERVER_SERVICE.lower(),
+                *(m.get("server_service", "").lower()
+                  for m in all_models.values() if m.get("vllm")),
+            }
+            if service.strip().lower() in vllm_services:
                 containers.append(
                     {
                         "compose": "vllm",
@@ -1321,6 +1329,12 @@ def list_vllm_compose_containers() -> list[dict]:
     valid_dirs = {VLLM_WORKING_DIR_LABEL, str(Path(VLLM_WORKING_DIR_LABEL) / "stacks")}
     valid_dirs_list = [d.rstrip("/") for d in valid_dirs]
 
+    models, _ = get_models()
+    vllm_services = {
+        VLLM_SERVER_SERVICE.lower(),
+        *(m.get("server_service", "").lower()
+          for m in models.values() if m.get("vllm")),
+    }
     containers = []
     for line in output.splitlines():
         parts = line.split("|", 4)
@@ -1329,8 +1343,8 @@ def list_vllm_compose_containers() -> list[dict]:
         working_dir, config_files, service, status, name = parts
         if working_dir.rstrip("/") not in valid_dirs_list:
             continue
-        # Check if this container belongs to the vllm server service
-        if service.strip().lower() == VLLM_SERVER_SERVICE.lower():
+        # Check if this container belongs to any discovered vLLM server service.
+        if service.strip().lower() in vllm_services:
             # Resolve which compose file is active from the Docker project label
             compose_basename = (
                 Path(config_files.split(",")[0].strip()).name
@@ -2599,13 +2613,26 @@ def run_single_benchmark(
         # No, body = json.loads(output) likely failed because output is a stream.
         # Let's fix the JSON loading for vLLM streams.
         
-        # Re-parse output for usage block
-        usage_match = re.search(r'"usage":\s*({[^}]+})', output)
-        if usage_match:
+        # Re-parse output for usage block.
+        # NOT a regex: vLLM's usage stopped being flat once the launcher passed
+        # --enable-prompt-tokens-details (upstream qwen38-27b-rtx3090 bb739e4,
+        # 2026-09-01), which nests prompt_tokens_details inside it. The old
+        # r'"usage":\s*({[^}]+})' stopped at the FIRST closing brace, captured
+        # unbalanced JSON, and every run failed with "usage missing".
+        # Walk the SSE chunks instead and keep the last one that carries usage.
+        for _line in output.splitlines():
+            _line = _line.strip()
+            if not _line.startswith("data:"):
+                continue
+            _payload = _line[5:].strip()
+            if not _payload or _payload == "[DONE]":
+                continue
             try:
-                usage = json.loads(usage_match.group(1))
+                _chunk = json.loads(_payload)
             except Exception:
-                pass
+                continue
+            if isinstance(_chunk, dict) and _chunk.get("usage"):
+                usage = _chunk["usage"]
         
         if not usage:
             # Fallback to common choice-based usage if available
@@ -4267,14 +4294,13 @@ INDEX_HTML = r"""<!doctype html>
         box-shadow: 2px 0 24px rgba(0,0,0,0.5);
       }
       .sidebar.open { transform: translateX(0); }
-      /* Position the Request Log (Activity Panel) below the GPU chart and details panel on mobile.
-         Order: stats → switch status → GPU chart & details → Activity/Request Log. */
+      /* Order: stats → switch status → GPU chart & details. The request log is a
+         fixed bottom drawer, not part of this flow. */
       .main-content { display: flex; flex-direction: column; }
       .main-content > * { flex: 0 0 auto; }   /* don't let flex shrink panels below content height */
       .stats-row { order: 0; }
       .switch-status-bar { order: 1; }
       .content-grid { order: 2; }
-      .activity-panel { order: 3; margin-top: 0; }
     }
     /* ── Phone: compact layout ── */
     @media (max-width: 600px) {
@@ -4838,31 +4864,21 @@ INDEX_HTML = r"""<!doctype html>
     .mb-pre { color: #8fb8ff; border-color: rgba(79,141,251,0.24); background: rgba(79,141,251,0.09); }
     .mb-unit { font-size: 8px; font-weight: 600; opacity: 0.6; letter-spacing: 0.2px; }
 
-    /* ── Fill the viewport: the request log takes whatever height is left ──
+    /* ── Fill the viewport: the grid keeps its natural height, the content
+       column scrolls if it exceeds the viewport, and the request log is a fixed
+       bottom drawer that no longer consumes flow space. ──
        Guarded on a tall-enough desktop window; below that the page keeps its normal
        scrolling behaviour rather than squeezing every panel into a sliver. */
     @media (min-width: 1201px) and (min-height: 760px) {
-      .main-content { overflow: hidden; }
       .content-grid { flex: 0 0 auto; }
       /* Scoped to the top chart: .chart-panel-sm shares the .chart-panel class and
          must stay auto-height so it fills its grid row. */
       .content-grid > .chart-panel { height: auto; min-height: 248px; }
       .chart-panel-sm { height: auto; }
       /* The merged card spans both rows, so an unbounded benchmark list would
-         inflate the whole grid and push the request log off the viewport; cap
-         the list (min-height 84 above clamps it just below one row). */
+         inflate the whole grid; cap the list (min-height 84 above clamps it just below one row). */
       .bench-history { max-height: 76px; }
       .info-panel { gap: 7px; padding: 12px 15px; }
-      .activity-panel {
-        flex: 1 1 auto;
-        min-height: 220px;
-        margin-top: 0;
-        overflow: hidden;
-      }
-      .activity-body { display: flex; flex-direction: column; min-height: 0; flex: 1; }
-      .activity-body[hidden] { display: none; }
-      .reqlog-scroll { max-height: none; flex: 1; min-height: 0; }
-      .events-body { max-height: none; flex: 1; min-height: 0; }
     }
 
     /* ── Wide screens: the six stat cards get roomy, so let content breathe ── */
@@ -4888,6 +4904,73 @@ INDEX_HTML = r"""<!doctype html>
       .chart-panel { height: 260px; }
       .chart-panel-sm { height: 240px; }
       .table-panel { max-height: none; }
+    }
+    /* ── Request log drawer ──
+       The activity panel is not part of the page flow: it is a fixed drawer
+       the bottom bar unfolds over the lower ~2/3 of the viewport. The page
+       above stays visible and interactive; the content column scrolls
+       clear of the bar via padding-bottom. */
+    .activity-panel {
+      position: fixed;
+      left: var(--sidebar-w);
+      right: 0;
+      bottom: 44px;
+      height: calc(66vh - 44px);
+      transform: translateY(calc(100% + 60px));
+      transition: transform 0.22s ease;
+      z-index: 300;
+      margin-top: 0;
+      border-bottom: none;
+      border-radius: 12px 12px 0 0;
+    }
+    .activity-panel.open { transform: translateY(0); }
+    .activity-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+    .activity-body[hidden] { display: none; }
+    .reqlog-scroll { max-height: none; flex: 1; min-height: 0; }
+    .events-body { max-height: none; flex: 1; min-height: 0; }
+    .log-drawer-bar {
+      position: fixed;
+      left: var(--sidebar-w);
+      right: 0;
+      bottom: 0;
+      height: 44px;
+      z-index: 320;
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      background: var(--card);
+      border-top: 1px solid var(--border-strong);
+    }
+    .log-drawer-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1;
+      padding: 9px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .log-drawer-btn:hover { color: var(--text); background: rgba(59,130,246,0.08); }
+    .log-drawer-count {
+      background: rgba(59,130,246,0.15);
+      border: 1px solid rgba(59,130,246,0.4);
+      color: var(--accent);
+      border-radius: 8px;
+      padding: 0 7px;
+      font-size: 11px;
+      line-height: 17px;
+      font-family: var(--font-mono);
+    }
+    .log-drawer-count:empty { display: none; }
+    .main-content { padding-bottom: 64px; }
+    @media (max-width: 768px) {
+      .log-drawer-bar, .activity-panel { left: 0; }
     }
 
     /* ── Settings modal ── */
@@ -5172,6 +5255,9 @@ INDEX_HTML = r"""<!doctype html>
           </div>
       </div>
 
+
+    </div><!-- /.main-content -->
+  </div><!-- /.app-body -->
       <!-- Activity: Request Log + Events -->
       <div class="activity-panel" id="activityPanel">
         <div class="activity-head">
@@ -5217,9 +5303,14 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
       </div>
-
-    </div><!-- /.main-content -->
-  </div><!-- /.app-body -->
+  <!-- Request log drawer bar: unfold/fold the activity panel over the lower page -->
+  <div class="log-drawer-bar" id="reqlogBar">
+    <button class="log-drawer-btn" id="reqlogDrawerBtn" onclick="toggleReqlogDrawer()" aria-expanded="false" aria-controls="activityPanel">
+      <span id="reqlogDrawerChevron" aria-hidden="true">&#9650;</span>
+      Request Log
+      <span class="log-drawer-count" id="reqlogBarCount"></span>
+    </button>
+  </div>
 
   <!-- Confirmation modal -->
   <div id="confirmModal" class="modal-overlay">
@@ -6436,16 +6527,25 @@ INDEX_HTML = r"""<!doctype html>
       if (document.querySelector('.sidebar').classList.contains('open')) closeSidebar();
       else openSidebar();
     }
+    // The request log lives in a fixed bottom drawer (see .log-drawer-bar).
+    function openReqlogDrawer() {
+      document.getElementById('activityPanel').classList.add('open');
+      document.getElementById('reqlogDrawerBtn').setAttribute('aria-expanded', 'true');
+      document.getElementById('reqlogDrawerChevron').innerHTML = '&#9660;';
+      refreshRequestLog(true);
+    }
+    function closeReqlogDrawer() {
+      document.getElementById('activityPanel').classList.remove('open');
+      document.getElementById('reqlogDrawerBtn').setAttribute('aria-expanded', 'false');
+      document.getElementById('reqlogDrawerChevron').innerHTML = '&#9650;';
+    }
+    function toggleReqlogDrawer() {
+      if (document.getElementById('activityPanel').classList.contains('open')) closeReqlogDrawer();
+      else openReqlogDrawer();
+    }
     window.addEventListener('resize', () => { if (window.innerWidth > 768) closeSidebar(); });
 
     // Quick navigation from the drawer/sidebar to a section.
-    // Scroll the .main-content container explicitly (scrollIntoView is unreliable
-    // inside a nested overflow container).
-    function scrollMainTo(el) {
-      const main = document.querySelector('.main-content');
-      const top = el.getBoundingClientRect().top - main.getBoundingClientRect().top + main.scrollTop - 8;
-      main.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
-    }
     function goTo(section) {
       closeSidebar();
       setTimeout(() => {
@@ -6453,10 +6553,10 @@ INDEX_HTML = r"""<!doctype html>
           document.querySelector('.main-content').scrollTo({ top: 0, behavior: 'smooth' });
         } else if (section === 'requests') {
           switchActivityTab('reqlog');
-          scrollMainTo(document.getElementById('activityPanel'));
+          openReqlogDrawer();
         } else if (section === 'events') {
           switchActivityTab('events');
-          scrollMainTo(document.getElementById('activityPanel'));
+          openReqlogDrawer();
         }
       }, 60);
     }
@@ -6556,18 +6656,22 @@ INDEX_HTML = r"""<!doctype html>
         const d = await r.json();
         const body = document.getElementById('reqlogBody');
         const countEl = document.getElementById('reqlogCount');
+        const barCount = document.getElementById('reqlogBarCount');
         if (!d.available) {
           body.innerHTML = '<tr><td colspan="10" class="reqlog-empty">No request log yet — start a model stack, then send a request to port 8080 or 28082.</td></tr>';
           countEl.textContent = '';
+          if (barCount) barCount.textContent = '';
           return;
         }
         if (d.error) {
           body.innerHTML = '<tr><td colspan="10" class="reqlog-empty">Error reading log: ' + escHtml(d.error) + '</td></tr>';
           countEl.textContent = '';
+          if (barCount) barCount.textContent = '';
           return;
         }
         const rows = d.rows || [];
         countEl.textContent = rows.length ? String(rows.length) : '';
+        if (barCount) barCount.textContent = rows.length ? String(rows.length) : '';
         if (!rows.length) {
           body.innerHTML = '<tr><td colspan="10" class="reqlog-empty">No matching requests.</td></tr>';
           return;

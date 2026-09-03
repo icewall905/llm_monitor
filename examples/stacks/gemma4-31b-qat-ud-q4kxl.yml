@@ -1,0 +1,192 @@
+# LLM_META display_name="Gemma 4 31B QAT (UD-Q4_K_XL MTP)"
+# LLM_META family="gemma"
+# LLM_META params="31B"
+# LLM_META quant="UD-Q4_K_XL"
+# LLM_META ctx_size="131072"
+# LLM_META thinking="true"
+# LLM_META vision="true"
+# LLM_META server_service="gemma4-31b-qat"
+# LLM_META sort_order="3.15"
+# ─────────────────────────────────────────────────────────────────────────────
+# Example llama.cpp stack, sanitized from the author's
+# llama.cpp/stacks/gemma4-31b-qat-ud-q4kxl.yml daily driver (single RTX 3090).
+# It showcases the pieces that matter for the gpu-monitor:
+#   · Gemma 4 31B QAT UD-Q4_K_XL main model + MTP speculative decoding using a
+#     non-QAT Q8_0 draft (same architecture, compatible with the QAT main)
+#   · multimodal (mmproj), NOT offloaded, so the tower stays off the VRAM budget
+#   · q4_0 KV cache (q5_0/q5_1 lack CUDA kernels -> 9x TG slowdown at 128k),
+#     f16 DRAFT cache only (q8_0 draft cache dropped acceptance to ~0.50-0.67)
+#   · a host-RAM prompt-cache pool since Gemma 4 cannot shift KV cache
+#   · a request-logging access-logger in front (server_service = the engine, but
+#     HTTP traffic flows through the logger on :8080)
+#
+# The heavy per-host pieces are dropped: the middleware/ollama proxy fleet,
+# llm-proxy-ui, autoheal, api-router, and claude-code-proxy. See the
+# minimal/full-proxy examples for those helpers, and the vLLM example for the
+# Qwen3.8 vLLM-side stack. Replace /path/to/... with real paths.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # --- Request-logging reverse proxy: everything on :8080 goes through here,
+  # so every request is logged. Runtime-only hop; the fleet still boots if it
+  # is down — requests just fail.
+  access-logger:
+    image: python:3.11-slim
+    container_name: access-logger-gemma4-31b-qat
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    networks:
+      - llm-network
+    depends_on:
+      gemma4-31b-qat:
+        condition: service_healthy
+    volumes:
+      - /path/to/access-logger.py:/app/access-logger.py
+      - /path/to/request_logger.py:/app/request_logger.py
+      - /path/to/request-logs:/logs
+    command: >
+      sh -c "pip install flask requests waitress && python /app/access-logger.py"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+    labels:
+      - "autoheal=true"
+    environment:
+      UPSTREAM_BASE_URL: "http://llm-server:8080"
+      LISTEN_PORT: "8080"
+      REQUEST_TIMEOUT: "900"
+      REQUEST_LOG_DB: "/logs/requests.db"
+      REQUEST_LOG_ENDPOINT: "8080"
+      LOG_PROMPT_SNIPPET: "true"
+      SNIPPET_MAX_CHARS: "200"
+
+  # --- The LLM engine ---
+  # MTP draft: unsloth/gemma-4-31B-it-GGUF (non-QAT) — same architecture, QAT-main compatible.
+  gemma4-31b-qat:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: gemma4-31b-qat-server
+    restart: unless-stopped
+    networks:
+      llm-network:
+        aliases:
+          - llm-server
+    labels:
+      - "autoheal=true"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ulimits:
+      memlock: -1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 300s
+      retries: 3
+    volumes:
+      - /path/to/models:/models:ro
+    environment:
+      HF_TOKEN: "${HF_TOKEN}"
+
+      LLAMA_ARG_MODEL: "/models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
+      LLAMA_ARG_ALIAS: "currentmodel"
+
+      LLAMA_ARG_CTX_SIZE: "131072"
+      LLAMA_ARG_N_PARALLEL: "1"
+
+      LLAMA_ARG_JINJA: "true"
+      LLAMA_ARG_REASONING: "on"
+
+      LLAMA_ARG_N_GPU_LAYERS: "999"
+      LLAMA_ARG_FLASH_ATTN: "on"
+
+      LLAMA_ARG_BATCH: "2048"
+      LLAMA_ARG_UBATCH: "512"
+
+      # --mlock deprecated since build ~10298; --load-mode is the supported form.
+      LLAMA_ARG_LOAD_MODE: "mmap+mlock"
+      LLAMA_ARG_CACHE_PROMPT: "true"
+
+      # Host-RAM prompt-cache pool (NOT VRAM). Default 8192 MiB is small for the
+      # many client endpoints, each with its own system prompt. Gemma 4 does not
+      # support --cache-reuse KV shifting, so this pool is the only cross-request
+      # reuse mechanism available.
+      LLAMA_ARG_CACHE_RAM: "24576"
+
+      # NOT set: context shift is unusable here — Gemma 4's interleaved-SWA cache
+      # cannot be shifted ("KV cache shifting is not supported for this context").
+      # LLAMA_ARG_CONTEXT_SHIFT: "true"
+
+      # q4_0 is critical — q5_0/q5_1 lack CUDA kernels -> 9x TG slowdown at 128k.
+      LLAMA_ARG_CACHE_TYPE_K: "q4_0"
+      LLAMA_ARG_CACHE_TYPE_V: "q4_0"
+      LLAMA_ARG_N_PREDICT: "-1"
+
+      # Draft KV back to f16: q8_0 draft cache dropped acceptance from ~0.74/0.80
+      # to ~0.50-0.67 (TG ~13% slower). f16 over 131072 ctx costs ~0.5-1 GB VRAM.
+      # The draft KV is a SEPARATE cache; CACHE_TYPE_K/V above does not apply to it.
+
+      # Gemma 4 recommended sampling (Unsloth) — see command: block below. Only
+      # LLAMA_ARG_TOP_K is a real env var; --temp/--top-p/--min-p have no env-var
+      # binding in this build and must be passed as CLI flags.
+      LLAMA_ARG_TOP_K: "64"
+
+      # MTP speculative decoding — QAT-specific Q8_0 draft (~420 MB less VRAM than
+      # BF16, negligible quality diff). n-max=2 chosen empirically: +6% tok/s and
+      # higher draft acceptance than 4 on this workload.
+      LLAMA_ARG_SPEC_DRAFT_N_MAX: "2"
+      LLAMA_ARG_N_GPU_LAYERS_DRAFT: "999"
+    command:
+      - "--spec-type"
+      - "draft-mtp"
+      - "--model-draft"
+      - "/models/gemma-4-31B-it-qat-MTP-Q8_0.gguf"
+      - "--mmproj"
+      - "/models/mmproj-BF16-gemma4-31b-qat.gguf"
+      - "--no-mmproj-offload"
+      # Sampling must live here — these flags have no env-var binding (see above).
+      - "--temp"
+      - "1.0"
+      - "--top-p"
+      - "0.95"
+      - "--min-p"
+      - "0.05"
+
+  # --- Minimal OpenAI-compatible endpoint on :11434, like the other examples.
+  ollama-proxy:
+    image: python:3.11-slim
+    container_name: ollama-proxy-gemma4-31b-qat
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    networks:
+      - llm-network
+    depends_on:
+      gemma4-31b-qat:
+        condition: service_healthy
+    volumes:
+      - /path/to/ollama-proxy.py:/app/ollama-proxy.py
+    command: >
+      sh -c "pip install flask requests waitress && python /app/ollama-proxy.py"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    environment:
+      OPENAI_API_BASE_URL: "http://llm-server:8080/v1"
+      PROXY_MODEL_FILENAME: "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
+      REQUEST_TIMEOUT: "900"
+
+networks:
+  llm-network:
+    driver: bridge

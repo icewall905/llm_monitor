@@ -1,0 +1,223 @@
+# LLM_META display_name="Qwen3.8 27B — MTP Optimized (256K KVarN, W4A8 balanced)"
+# LLM_META family="vllm"
+# LLM_META params="27B"
+# LLM_META quant="W4A8_MTP_KVARN_K4V2"
+# LLM_META ctx_size="262144"
+# LLM_META thinking="true"
+# LLM_META vision="true"
+# LLM_META max_seqs="8"
+# LLM_META server_service="vllm-server"
+# LLM_META sort_order="3.83"
+# ─────────────────────────────────────────────────────────────────────────────
+# Example vLLM stack, sanitized from the author's qwen38-27b-mtp-256k-optimized.yml
+# daily driver (RTX 3090, TP=1). It showcases the pieces that matter for the
+# gpu-monitor:
+#   · the custom engine build (MTP-3 speculative decoding + KVarN k4v2 KV cache)
+#   · prefix caching pinned to 128-token match units so SHORT prompts actually hit
+#   · priority scheduling so interactive traffic jumps ahead of long batch jobs
+#   · W4A8 (int8 activations) on gate_up + both attention families, NOT down_proj —
+#     the "balanced" profile: ~66% of the perplexity cost for ~75% of the speed win
+#   · a request-logging access-logger in front (server_service = vllm-server, but
+#     HTTP traffic flows through the logger on :8080)
+#
+# The heavy per-host pieces are dropped: the api_key.txt secret mount, the
+# start_qwen-local.sh override mount, the legacy stock-vLLM service, and the whole
+# proxy fleet (claude-code-proxy, middleware-proxy-*, ollama-proxy-*, autoheal,
+# api-router). See the minimal/full-proxy examples for the llama.cpp-side helpers.
+# Replace /path/to/... with real paths, and set the engine image to your build.
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-qwen38-optimized: &qwen38-optimized
+  image: qwen38-27b-3090:latest
+  build:
+    context: /path/to/qwen38-27b-rtx3090
+  ipc: host
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    HOME: /cache
+    PORT: "8080"
+    # CTX=huge selects the 256K KVarN geometry in the launcher.
+    CTX: "${CTX:-huge}"
+    SPEC: "${SPEC:-mtp}"
+    # 262144 = the model's native max_position_embeddings. KV is allocated ON
+    # DEMAND, not reserved; always budget from the boot log's "GPU KV cache
+    # size" line, never from theory.
+    MAX_LEN: "${MAX_LEN:-262144}"
+    # Empty -> the checkpoint's own chat template resolves 'xhigh' (max effort).
+    # Set REASONING_EFFORT=medium/low to lower the default; a per-request
+    # "reasoning_effort" ("none" turns thinking off) overrides either way.
+    REASONING_EFFORT: "${REASONING_EFFORT:-}"
+    # More slots cost ~nothing and BUY pool: dropping to 2 clamps CUDA-graph
+    # captures but the hybrid allocator hands back even MORE pool than that buys.
+    MAX_SEQS: "${MAX_SEQS:-8}"
+    FAST_VARIANT: "1"
+    DFLASH2: "1"
+    GPU_UTIL: "${GPU_UTIL:-0.97}"
+    # Prefix caching on the MTP+KVarN path needs the multi-query verify step
+    # uncaptured; the launcher enforces cudagraph_mode=PIECEWISE for SPEC=mtp +
+    # CTX=huge when this is 1. FULL_AND_PIECEWISE is unsafe (a cache hit corrupts
+    # a templated-prompt residue in every 128).
+    PREFIX_CACHE: "1"
+    CUDAGRAPH_MODE: "PIECEWISE"
+    # 128-token hash units. Without this the hybrid alignment backs off to the
+    # 2048-token block, so nothing under ~4096 tokens ever hits the cache and
+    # short prompts get 0 reuse. 128 divides every KV group block here (attention
+    # 2048, mamba 128). Do NOT copy to the dflash2 layout (needs 272).
+    PREFIX_MATCH_UNIT: "128"
+    # Priority scheduling: clients that opt in with a low/negative priority jump
+    # the FCFS queue ahead of long batch jobs.
+    SCHEDULING_POLICY: "priority"
+    # CPU KV offload stays off — the connector is incompatible with the 128-token
+    # match unit on this hybrid layout and pays an 8.5 GiB /dev/shm toll.
+    KV_OFFLOAD_SIZE: ""
+    KV_OFFLOAD_BACKEND: "native"
+    KV_OFFLOAD_REAP: "0"
+    # 2176 fits one aligned prefill block (2048) plus all eight MTP-3 decode
+    # positions (8*4) with a 128-token KVarN tile of margin. 8192 does NOT fit:
+    # it cost ~2.75 GiB of pool and the engine refused to boot at 262144.
+    MAX_NUM_BATCHED_TOKENS: "${MAX_NUM_BATCHED_TOKENS:-2176}"
+    # 0 = vision tower on GPU (verified serving real images). 1 reclaims its VRAM
+    # on a deliberately text-only deployment.
+    VISION: "${VISION:-1}"
+    # VISION_OFFLOAD=1 keeps the tower's weights in pinned host RAM, handed back
+    # ~0.85 GiB to the KV pool for ~36ms per image encode.
+    VISION_OFFLOAD: "${VISION_OFFLOAD:-1}"
+    # W4A8 balanced profile. Down-proj stays bf16 (where most MLP quality damage
+    # lives) — flipping this off with INT8_ACT empty is the one-line W4A16 revert;
+    # the single-dash default is deliberate so an explicitly empty value really
+    # means OFF.
+    INT8_ACT: "${INT8_ACT-int8}"
+    INT8_LAYERS: "${INT8_LAYERS:-gate_up|linear_attn|self_attn}"
+    # ⚠️ INT8_LAYERS="mlp|linear_attn" ALONE crashes at first forward. Use mlp,
+    # gate_up, or all three. Changing the layer set forces a ~118s recompile.
+    # ⚠️ The Intel8 knobs are INERT until the image is rebuilt with the Marlin
+    # patches.
+    # EXTRA_ARGS is expanded LAST on the launch exec line. It re-states
+    # --served-model-name after the launcher's hardcoded single name so all the
+    # aliases clients use (currentmodel / local-model) resolve. The 256 long-
+    # prefill threshold is the gentle setting for concurrent streaming decode;
+    # the parent stack originally shipped 1024.
+    EXTRA_ARGS: '${EXTRA_ARGS:---served-model-name qwen3.8-27b currentmodel local-model --limit-mm-per-prompt {"image":{"count":8}} --long-prefill-token-threshold 256}'
+  volumes:
+    - /path/to/models:/app/models
+    - /path/to/cache:/cache
+
+services:
+  # One-shot, idempotent preparation: downloads/requantizes the checkpoint and
+  # fetches the fast + DFlash2 variants.
+  prepare-qwen38-optimized:
+    <<: *qwen38-optimized
+    command: prepare
+    restart: "no"
+
+  # The engine. See file header for the parameter notes; the container name and
+  # network alias are what the gpu-monitor matches on (server_service: vllm-server).
+  vllm-server:
+    <<: *qwen38-optimized
+    container_name: vllm-qwen38-27b-server
+    command: single
+    restart: ${VLLM_RESTART:-unless-stopped}
+    stop_grace_period: 30s
+    gpus: all
+    networks:
+      llm-network:
+        aliases:
+          - llm-server
+    labels:
+      - "autoheal=true"
+    depends_on:
+      prepare-qwen38-optimized:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 900s
+      retries: 5
+    # Mount your own copy of start_qwen.sh over the baked-in one if you tune the
+    # launcher's serve args without rebuilding the image. The engine's API key
+    # file mount (api_key.txt) is omitted from this example on purpose.
+
+  # Request-logging reverse proxy: everything addressed via :8080 goes through
+  # here into the engine, so every request is logged. A runtime-only hop — the
+  # fleet still boots if it is down; requests just fail.
+  access-logger:
+    image: python:3.11-slim
+    container_name: access-logger-vllm
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    networks:
+      - llm-network
+    depends_on:
+      vllm-server:
+        condition: service_healthy
+    volumes:
+      - /path/to/access-logger.py:/app/access-logger.py
+      - /path/to/request_logger.py:/app/request_logger.py
+      - /path/to/request-logs:/logs
+    command: >
+      sh -c "pip install flask requests waitress && python /app/access-logger.py"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+    labels:
+      - "autoheal=true"
+    environment:
+      UPSTREAM_BASE_URL: "http://llm-server:8080"
+      LISTEN_PORT: "8080"
+      REQUEST_TIMEOUT: "900"
+      REQUEST_LOG_DB: "/logs/requests.db"
+      REQUEST_LOG_ENDPOINT: "8080"
+      LOG_PROMPT_SNIPPET: "true"
+      SNIPPET_MAX_CHARS: "200"
+      # Set this if the engine enforces an API key, and mount the key file at the
+      # matching container path. Omitted from the example volumes above.
+      UPSTREAM_API_KEY_FILE: ""
+      # Qwen's HF template accepts one leading system message; merge extras here
+      # so vLLM-compatible agents that send two system prompts keep working.
+      MERGE_LEADING_SYSTEM_MESSAGES: "true"
+      # llama.cpp /props compatibility: vLLM has no /props, so access-logger
+      # synthesizes the document when the upstream answers 404. Keep in sync with
+      # the engine's max_n_seqs and sampler.
+      PROPS_TOTAL_SLOTS: "${MAX_SEQS:-8}"
+      PROPS_TEMPERATURE: "${TEMP:-0.7}"
+      PROPS_TOP_P: "${TOP_P:-0.80}"
+      PROPS_TOP_K: "${TOP_K:-20}"
+      PROPS_MIN_P: "${MIN_P:-0.0}"
+
+  # Minimal OpenAI-compatible endpoint on :11434, like the llama.cpp examples.
+  ollama-proxy:
+    image: python:3.11-slim
+    container_name: ollama-proxy-vllm
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    networks:
+      - llm-network
+    depends_on:
+      vllm-server:
+        condition: service_healthy
+    volumes:
+      - /path/to/ollama-proxy.py:/app/ollama-proxy.py:ro
+    command: >
+      sh -c "pip install flask requests waitress && python /app/ollama-proxy.py"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    environment:
+      OPENAI_API_BASE_URL: "http://access-logger:8080/v1"
+      PROXY_MODEL_FILENAME: "currentmodel"
+      REQUEST_TIMEOUT: "900"
+
+networks:
+  llm-network:
+    driver: bridge

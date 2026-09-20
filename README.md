@@ -10,6 +10,7 @@ This project runs a web UI plus terminal monitor (`nvtop` or `btop`) and discove
 - Shows active model status and health.
 - Triggers model switches by calling an external `switch-llm.sh` script.
 - Exposes benchmark and restart/stop actions from the UI.
+- Remembers the KV pool each vLLM stack allocated (`kv_pools` table in `metrics.db`) and shows it on the sidebar model card, so pool sizes are comparable across stacks that are not running.
 
 ## Requirements
 

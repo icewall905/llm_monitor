@@ -2934,6 +2934,50 @@ def start_switch(model_key: str) -> tuple[bool, str]:
     return True, f"Switch request accepted: {model['label']}"
 
 
+def _start_vllm_proxy_fleet(compose_path: Path) -> None:
+    """Bring the shared proxy fleet up for stacks that do not bake it in.
+
+    Proxies, routers and the access logger were extracted to llm-proxies.yml on
+    2026-09-08. Stacks written after that date carry ONLY the model server, so
+    the plain `up -d --remove-orphans` in start_vllm_switch() leaves nothing
+    listening on 8080/11434/28080 — and reaps the fleet as an orphan when it was
+    already running. Mirrors start_stack() in switch-vllm.sh.
+    """
+    proxies_file = VLLM_DIR / "llm-proxies.yml"
+    if not proxies_file.is_file():
+        _append_log_event(
+            "warning", "switch",
+            f"{proxies_file} is missing; only the model server is up and "
+            "nothing is published on 8080.")
+        return
+
+    # Older stacks still declare the fleet themselves — starting it twice would
+    # collide on container names and ports.
+    exit_code, output = run_command([
+        "bash", "-lc",
+        f"docker compose --project-directory {shlex.quote(str(VLLM_DIR))} "
+        f"-f {shlex.quote(str(compose_path))} config --services",
+    ])
+    if exit_code == 0 and "access-logger" in output.split():
+        return
+
+    _append_log_event("info", "switch",
+                      "Stack ships no proxies — starting llm-proxies.yml...")
+    # COMPOSE_IGNORE_ORPHANS: this invocation sees the model server as an orphan
+    # (different file, same project) and would nag on every switch. Do NOT "fix"
+    # that with --remove-orphans — it would delete the server.
+    exit_code, output = run_command([
+        "bash", "-lc",
+        "COMPOSE_IGNORE_ORPHANS=True docker compose -p vllm "
+        f"--project-directory {shlex.quote(str(VLLM_DIR))} "
+        f"-f {shlex.quote(str(proxies_file))} up -d",
+    ])
+    if exit_code != 0:
+        _append_log_event(
+            "error", "switch",
+            f"Proxy fleet start failed (exit {exit_code}): {output[-500:]}")
+
+
 def start_vllm_switch(
     compose_file: str | None = None,
     model_key: str = "vllm",
@@ -3012,6 +3056,10 @@ def start_vllm_switch(
                     STATE["last_message"] = f"{label} start failed (exit {exit_code})"
                 _append_log_event("error", "switch", f"{label} start failed (exit {exit_code})")
                 return
+
+            # The model server is up; the proxy fleet lives in its own file and
+            # was just reaped by --remove-orphans (or never started).
+            _start_vllm_proxy_fleet(compose_path)
 
             # Poll until healthy
             deadline = time.time() + SWITCH_READY_TIMEOUT_SEC
@@ -3306,6 +3354,20 @@ def init_metrics_db() -> bool:
                     "CREATE INDEX IF NOT EXISTS idx_benchmarks_model "
                     "ON benchmarks (model_key, success, ts DESC)"
                 )
+                # Last KV pool the engine actually allocated, per model. The pool size is
+                # only knowable while the stack is up, but it is the figure you want when
+                # deciding WHICH stack to boot, so it has to outlive the container.
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS kv_pools (
+                        model_key       TEXT PRIMARY KEY,
+                        ts              INTEGER NOT NULL,
+                        pool_tokens     INTEGER,
+                        max_concurrency REAL,
+                        ctx_size        INTEGER
+                    )
+                    """
+                )
                 conn.commit()
             finally:
                 conn.close()
@@ -3509,6 +3571,76 @@ def load_benchmark_history(limit: int = FULL_BENCHMARK_MAX_HISTORY) -> list[dict
         d["success"] = bool(d["success"])
         out.append(d)
     return out
+
+
+_KV_POOL_LAST_WRITE: dict[str, tuple[int, float]] = {}
+_KV_POOL_WRITE_EVERY_SEC = 900
+
+
+def record_kv_pool(model_key: str, pool_tokens, max_concurrency, ctx_size) -> None:
+    """Persist the KV pool the live engine reports for this model.
+
+    Written on change, and otherwise at most every 15 minutes, so the status poll
+    (a few seconds) does not turn into a write loop.
+    """
+    if not METRICS_DB_READY or not model_key or not pool_tokens:
+        return
+    try:
+        tokens = int(pool_tokens)
+    except (TypeError, ValueError):
+        return
+    if tokens <= 0:
+        return
+    now = time.time()
+    prev = _KV_POOL_LAST_WRITE.get(model_key)
+    if prev and prev[0] == tokens and (now - prev[1]) < _KV_POOL_WRITE_EVERY_SEC:
+        return
+    try:
+        with METRICS_DB_LOCK:
+            conn = _metrics_connect()
+            try:
+                conn.execute(
+                    "INSERT INTO kv_pools (model_key, ts, pool_tokens, max_concurrency, ctx_size) "
+                    "VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(model_key) DO UPDATE SET ts=excluded.ts, "
+                    "pool_tokens=excluded.pool_tokens, max_concurrency=excluded.max_concurrency, "
+                    "ctx_size=excluded.ctx_size",
+                    (model_key, int(now), tokens,
+                     float(max_concurrency) if isinstance(max_concurrency, (int, float)) else None,
+                     int(ctx_size) if isinstance(ctx_size, int) else None),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        _KV_POOL_LAST_WRITE[model_key] = (tokens, now)
+    except Exception as exc:  # noqa: BLE001
+        _append_log_event("warning", "metrics", f"Could not persist KV pool size: {exc}")
+
+
+def model_kv_pool_summary() -> dict:
+    """Last observed KV pool per model, for the sidebar cards."""
+    if not METRICS_DB_READY or not os.path.exists(METRICS_DB):
+        return {}
+    try:
+        conn = _metrics_connect(readonly=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            rows = conn.execute(
+                "SELECT model_key, ts, pool_tokens, max_concurrency, ctx_size FROM kv_pools"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return {}
+    return {
+        r[0]: {
+            "ts": r[1],
+            "pool_tokens": r[2],
+            "max_concurrency": r[3],
+            "ctx_size": r[4],
+        }
+        for r in rows
+    }
 
 
 def model_benchmark_summary() -> dict:
@@ -3736,6 +3868,9 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
             context_info["pool_max_concurrency"] = throughput.get("kv_max_concurrency")
             context_info["requests_running"] = throughput.get("requests_running")
             context_info["requests_waiting"] = throughput.get("requests_waiting")
+            # Remember it: once the stack is down the pool figure is unrecoverable.
+            record_kv_pool(active_key, kv_tokens,
+                           throughput.get("kv_max_concurrency"), ctx_size)
 
             avg_prompt = throughput.get("avg_prompt_per_request")
             avg_gen = throughput.get("avg_gen_per_request")
@@ -3826,6 +3961,7 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
         benchmark = dict(BENCHMARK_STATE)
 
     bench_by_model = model_benchmark_summary()
+    kv_pool_by_model = model_kv_pool_summary()
 
     status = {
         "active": active,
@@ -3857,6 +3993,9 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
                 # Latest successful benchmark for this model, so the sidebar card can
                 # show measured speeds without the model being loaded.
                 "bench": bench_by_model.get(key),
+                # Last KV pool this stack allocated when it was up, so the card shows the
+                # likely pool size before you boot it.
+                "kv_pool": kv_pool_by_model.get(key),
             }
             for key, m in models.items()
         ],
@@ -4862,6 +5001,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .mb-gen { color: #6fe3b6; border-color: rgba(33,201,138,0.24); background: rgba(33,201,138,0.09); }
     .mb-pre { color: #8fb8ff; border-color: rgba(79,141,251,0.24); background: rgba(79,141,251,0.09); }
+    .mb-kv  { color: #d7b0ff; border-color: rgba(167,110,251,0.24); background: rgba(167,110,251,0.09); }
     .mb-unit { font-size: 8px; font-weight: 600; opacity: 0.6; letter-spacing: 0.2px; }
 
     /* ── Fill the viewport: the grid keeps its natural height, the content
@@ -5682,6 +5822,15 @@ INDEX_HTML = r"""<!doctype html>
       return n + ' ctx';
     }
 
+    // Pool sizes run to the hundreds of thousands; k is the readable unit.
+    function fmtPool(val) {
+      const n = Number(val);
+      if (!n) return '--';
+      if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+      if (n >= 1000) return Math.round(n / 1000) + 'k';
+      return String(n);
+    }
+
     function buildSidebar(data) {
       const q = searchQuery.toLowerCase().trim();
       const groups = {};
@@ -5718,6 +5867,18 @@ INDEX_HTML = r"""<!doctype html>
           if (m.quant) tags += `<span class="tag-pill tag-quant">${escHtml(m.quant)}</span>`;
           if (m.thinking) tags += `<span class="tag-pill tag-cot">COT</span>`;
           if (m.vision) tags += `<span class="tag-pill tag-vision">VISION</span>`;
+          // Last KV pool this stack allocated, persisted per model. It only exists while
+          // the engine runs, so this is the only way to compare pools across stacks.
+          let kvPill = '';
+          if (m.kv_pool && m.kv_pool.pool_tokens) {
+            const tok = m.kv_pool.pool_tokens;
+            const conc = m.kv_pool.max_concurrency;
+            const kvWhen = m.kv_pool.ts ? new Date(m.kv_pool.ts * 1000).toLocaleString() : 'unknown time';
+            const kvT = `Last KV pool — ${tok.toLocaleString()} tokens`
+              + (conc ? `, ${Number(conc).toFixed(1)}x full windows` : '')
+              + ` (${kvWhen})`;
+            kvPill = `<span class="mb-pill mb-kv" title="${escHtml(kvT)}">\u25a4 ${fmtPool(tok)}<span class="mb-unit">kv</span></span>`;
+          }
           // Measured speeds from the last successful benchmark, persisted per model.
           let benchRow = '';
           if (m.bench && (m.bench.gen_tps || m.bench.prefill_tps)) {
@@ -5726,10 +5887,13 @@ INDEX_HTML = r"""<!doctype html>
             const t = `Last ${prof} benchmark — ${when}`;
             const gen = m.bench.gen_tps ? Number(m.bench.gen_tps).toFixed(1) : '--';
             const pre = m.bench.prefill_tps ? Math.round(m.bench.prefill_tps) : '--';
-            benchRow = `<div class="model-bench" title="${escHtml(t)}">
-              <span class="mb-pill mb-gen">▶ ${gen}<span class="mb-unit">gen</span></span>
-              <span class="mb-pill mb-pre">▼ ${pre}<span class="mb-unit">ingest</span></span>
+            benchRow = `<div class="model-bench">
+              <span class="mb-pill mb-gen" title="${escHtml(t)}">▶ ${gen}<span class="mb-unit">gen</span></span>
+              <span class="mb-pill mb-pre" title="${escHtml(t)}">▼ ${pre}<span class="mb-unit">ingest</span></span>
+              ${kvPill}
             </div>`;
+          } else if (kvPill) {
+            benchRow = `<div class="model-bench">${kvPill}</div>`;
           }
           html += `<div class="${cls}" onclick="confirmSwitch('${m.key}','${escHtml(m.label)}')">
             <div class="model-row-inner">

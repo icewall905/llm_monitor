@@ -1256,8 +1256,26 @@ def list_llama_compose_containers() -> list[dict]:
     return containers
 
 
+def _current_stack_model_key(compose_to_model: dict) -> str | None:
+    """Resolve the active vLLM stack from the switcher's .current-stack state file.
+
+    A running container's compose label is stamped at `up` time and goes stale the
+    moment a stack file is renamed, so the label basename can name a file that no
+    longer exists. switch-vllm.sh rewrites .current-stack on every start, so it is
+    the more current of the two. Returns None if the file is missing or names a
+    stack that is no longer discovered.
+    """
+    try:
+        raw = (VLLM_DIR / ".current-stack").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return compose_to_model.get(Path(raw).name)
+
+
 def detect_active_model_key(containers: list[dict] | None = None) -> str | None:
-    _, compose_to_model = get_models()
+    models, compose_to_model = get_models()
     records = containers if containers is not None else list_llama_compose_containers()
     for c in records:
         model_key = compose_to_model.get(c["compose"])
@@ -1267,7 +1285,17 @@ def detect_active_model_key(containers: list[dict] | None = None) -> str | None:
     vllm_records = list_vllm_compose_containers()
     for c in vllm_records:
         if c.get("vllm") and c["status"].startswith("Up"):
-            return compose_to_model.get(c["compose"]) or "vllm"
+            model_key = compose_to_model.get(c["compose"])
+            if model_key:
+                return model_key
+            # Stale/unknown compose label (e.g. the stack file was renamed after
+            # `up`). Fall back to .current-stack, then to the generic "vllm" entry
+            # -- but only if it actually exists, since discover_models() creates it
+            # only when NO stack files were found. Returning a key that is absent
+            # from `models` used to raise KeyError in build_status().
+            return _current_stack_model_key(compose_to_model) or (
+                "vllm" if "vllm" in models else None
+            )
     return None
 
 
@@ -3788,8 +3816,8 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
         snapshot = dict(STATE)
 
     active = None
-    if active_key:
-        m = models[active_key]
+    m = models.get(active_key) if active_key else None
+    if m is not None:
         active = {
             "key": active_key,
             "max_seqs": m.get("max_seqs", ""),

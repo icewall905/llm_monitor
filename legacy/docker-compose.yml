@@ -1,0 +1,61 @@
+# Legacy single-host dashboard (pre hub/agent). Kept runnable for comparison:
+#   cd legacy && docker compose -p gpu-monitor-legacy up -d --build
+# It binds the same 9358 port as the hub, so stop one before starting the other.
+services:
+  gpu-monitor:
+    build:
+      context: ..
+      dockerfile: legacy/Dockerfile
+    container_name: gpu-monitor
+    pid: "host"
+    environment:
+      - MONITOR_APP=nvtop
+      - DASHBOARD_PORT=8080
+      - TTYD_INTERNAL_PORT=7681
+      - DASHBOARD_CONFIG=/gpu-monitor/config.yaml
+      - LLAMA_DIR=${LLAMA_DIR:-/mnt/nvmestorage/compose/llama.cpp}
+      - STACKS_DIR=${STACKS_DIR:-/mnt/nvmestorage/compose/llama.cpp/stacks}
+      - MODELS_DIR=${MODELS_DIR:-/mnt/nvmestorage/compose/llama.cpp/models}
+      - LLAMA_WORKING_DIR_LABEL=${LLAMA_WORKING_DIR_LABEL:-/mnt/nvmestorage/compose/llama.cpp}
+      - REQUEST_LOG_DB=${REQUEST_LOG_DB:-/request-logs/requests.db}
+      - VLLM_DIR=${VLLM_DIR:-/mnt/nvmestorage/compose/vllm}
+      - VLLM_SERVER_SERVICE=${VLLM_SERVER_SERVICE:-vllm-server}
+      - VLLM_API_KEY_FILE=${VLLM_API_KEY_FILE:-/mnt/nvmestorage/compose/vllm/qwen38-27b-rtx3090/api_key.txt}
+      - BEELLAMA_DIR=${BEELLAMA_DIR:-/mnt/nvmestorage/compose/beellama.cpp}
+    stdin_open: true
+    tty: true
+    ports:
+      - "9358:80"
+      - "9359:7681"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt/nvmestorage/compose/llama.cpp:/mnt/nvmestorage/compose/llama.cpp:ro
+      # Request log DB (read-write so the SQLite WAL reader can open -wal/-shm sidecars)
+      - /mnt/nvmestorage/compose/llama.cpp/request-logs:/request-logs:rw
+      - /mnt/nvmestorage/compose/vllm:/mnt/nvmestorage/compose/vllm:ro
+      - /mnt/nvmestorage/compose/beellama.cpp:/mnt/nvmestorage/compose/beellama.cpp:ro
+      # tabbyapi build context: the dashboard runs `docker compose up` for the
+      # tabbyapi stack, which must be able to read ../tabbyapi/src to (re)build the
+      # tabbyapi-exl3:local image when it is missing. Same host path as the context.
+      - /mnt/nvmestorage/compose/tabbyapi/src:/mnt/nvmestorage/compose/tabbyapi/src:ro
+      # Strata image sources: ensure_stack_images() rebuilds local/strata:* when pruned.
+      - /mnt/nvmestorage/compose/strata/Strata:/mnt/nvmestorage/compose/strata/Strata:ro
+      - /mnt/nvmestorage/compose/strata/image-curl:/mnt/nvmestorage/compose/strata/image-curl:ro
+      # Host /dev/shm: sweeper deletes leaked vLLM offload regions (dashboard-server.py)
+      - /dev/shm:/host-shm:rw
+      - ../config.yaml:/gpu-monitor/config.yaml:ro
+      - ../config.local.yaml:/gpu-monitor/config.local.yaml:ro
+      - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.580.126.09:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.580.126.09:ro
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+    restart: always

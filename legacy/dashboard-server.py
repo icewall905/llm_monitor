@@ -3,6 +3,7 @@ import ast
 import json
 import os
 import random
+import zlib
 import re
 import select
 import shlex
@@ -299,14 +300,18 @@ FULL_BENCHMARK_MAX_HISTORY = int(os.environ.get("BENCHMARK_HISTORY_LIMIT", "10")
 BENCHMARK_STALE_SEC = int(
     os.environ.get("BENCHMARK_STALE_SEC", str(max(BENCHMARK_TIMEOUT_SEC * 4, 600)))
 )
+# "kind" picks the context register (see BENCHMARK_CONTEXT_KINDS). The full profile
+# deliberately spans general prose, code and chat transcripts so the aggregate is not
+# one register's acceptance rate. Aggregates from before 2026-09-20 were taken with
+# opaque filler throughout and are NOT comparable with these.
 FULL_BENCHMARK_SPECS = [
-    {"name": "prefill_xl", "prompt_tokens": 4096, "n_predict": 32},
-    {"name": "prefill_heavy", "prompt_tokens": 2048, "n_predict": 64},
-    {"name": "prefill_medium", "prompt_tokens": 1024, "n_predict": 128},
-    {"name": "mixed", "prompt_tokens": 1024, "n_predict": 256},
-    {"name": "mixed_even", "prompt_tokens": 512, "n_predict": 512},
-    {"name": "gen_heavy", "prompt_tokens": 256, "n_predict": 1024},
-    {"name": "gen_xl", "prompt_tokens": 128, "n_predict": 2048},
+    {"name": "prefill_xl", "prompt_tokens": 4096, "n_predict": 32, "kind": "general"},
+    {"name": "prefill_heavy", "prompt_tokens": 2048, "n_predict": 64, "kind": "code"},
+    {"name": "prefill_medium", "prompt_tokens": 1024, "n_predict": 128, "kind": "chat"},
+    {"name": "mixed", "prompt_tokens": 1024, "n_predict": 256, "kind": "general"},
+    {"name": "mixed_even", "prompt_tokens": 512, "n_predict": 512, "kind": "code"},
+    {"name": "gen_heavy", "prompt_tokens": 256, "n_predict": 1024, "kind": "chat"},
+    {"name": "gen_xl", "prompt_tokens": 128, "n_predict": 2048, "kind": "general"},
 ]
 FULL_BENCHMARK_REPEATS = 2
 FULL_BENCHMARK_RUNS = len(FULL_BENCHMARK_SPECS) * FULL_BENCHMARK_REPEATS
@@ -334,7 +339,8 @@ METRICS_RANGES = {
 # that implies the model was idle when really nothing was sampling it.
 METRICS_LIVE_MAX_AGE_SEC = 20.0
 METRICS_LIVE_LOCK = threading.Lock()
-METRICS_LIVE = {"ts": 0.0, "tps": None, "ingest": None}
+METRICS_LIVE = {"ts": 0.0, "tps": None, "ingest": None, "running": None, "waiting": None,
+                "ctx_pct": None}
 METRICS_DB_LOCK = threading.Lock()
 METRICS_DB_READY = False
 
@@ -700,6 +706,7 @@ CONTEXT_STATE = {
 # ── vLLM Prometheus metrics cache ────────────────────────────────────────────
 VLLM_METRICS_CACHE_TTL_SEC = float(os.environ.get("VLLM_METRICS_CACHE_TTL_SEC", "1.0"))
 VLLM_METRICS_CACHE_LOCK = threading.Lock()
+VLLM_METRICS_SCRAPE = {"running": False}  # one background scrape at a time
 VLLM_METRICS_CACHE = {
     "container": None,
     "checked_at": 0.0,
@@ -1042,6 +1049,123 @@ def run_command(cmd: list[str]) -> tuple[int, str]:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     combined = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, combined.strip()
+
+
+# (2026-11-02) Missing-image self-healing. `docker image prune -a` (or a disk cleanup)
+# removes locally built engine images, and `up` then fails with "pull access denied" /
+# "No such image" because they have `pull_policy: never` or exist on no registry.
+# Before every stack start, ensure_stack_images() checks each service image and rebuilds
+# what is missing, in this order:
+#   1. a recipe in the compose file's top-level `x-gpu-monitor-images` extension:
+#        x-gpu-monitor-images:
+#          - image: local/base:tag            # listed in dependency order (bases first)
+#            context: /abs/path/to/source     # must be readable inside this container
+#            dockerfile: Dockerfile           # optional, relative to context
+#            args: {KEY: value}               # optional --build-arg
+#      A recipe is also built when a later missing image needs it (FROM base).
+#   2. the service's own `build:` section -> `docker compose build <service>`
+#   3. otherwise `docker pull <image>` (unless pull_policy: never)
+IMAGE_BUILD_TIMEOUT_SEC = int(os.environ.get("IMAGE_BUILD_TIMEOUT_SEC", "7200"))
+
+
+def _docker_image_exists(image: str) -> bool:
+    try:
+        return subprocess.run(["docker", "image", "inspect", image],
+                              capture_output=True, timeout=30).returncode == 0
+    except Exception:
+        return False
+
+
+def _run_logged(cmd: list[str], timeout: int) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        return 124, f"timeout after {timeout}s: {' '.join(cmd)}"
+
+
+def ensure_stack_images(compose_file: str | Path, project: str | None = None,
+                        cwd: str | Path | None = None,
+                        status_cb=None) -> tuple[bool, str]:
+    """Rebuild/pull any image a compose stack needs that is missing locally.
+    Returns (ok, message). Never raises."""
+    compose_file = Path(compose_file)
+    if not compose_file.is_absolute() and cwd:
+        compose_file = Path(cwd) / compose_file
+    base = ["docker", "compose"]
+    if project:
+        base += ["-p", project]
+    if cwd:
+        base += ["--project-directory", str(cwd)]
+    base += ["-f", str(compose_file)]
+    code, out = _run_logged(base + ["config", "--format", "json"], 120)
+    if code != 0:
+        return False, f"compose config failed: {out[-500:]}"
+    try:
+        cfg = json.loads(out)
+    except Exception as exc:
+        return False, f"compose config not JSON: {exc}"
+
+    recipes = {r["image"]: r for r in (cfg.get("x-gpu-monitor-images") or [])
+               if isinstance(r, dict) and r.get("image")}
+    order = list(recipes)
+
+    def note(msg: str, level: str = "info") -> None:
+        _append_log_event(level, "switch", msg)
+        if status_cb:
+            try:
+                status_cb(msg)
+            except Exception:
+                pass
+
+    def build_recipe(image: str) -> tuple[bool, str]:
+        r = recipes[image]
+        # Bases listed before this recipe are built first if they are missing too.
+        for dep in order[:order.index(image)]:
+            if not _docker_image_exists(dep):
+                ok, msg = build_recipe(dep)
+                if not ok:
+                    return ok, msg
+        ctx = str(r.get("context") or "")
+        if not ctx or not Path(ctx).is_dir():
+            return False, f"build context for {image} not readable in gpu-monitor: {ctx!r}"
+        cmd = ["docker", "build", "-t", image]
+        if r.get("dockerfile"):
+            cmd += ["-f", str(Path(ctx) / str(r["dockerfile"]))]
+        for k, v in (r.get("args") or {}).items():
+            cmd += ["--build-arg", f"{k}={v}"]
+        cmd.append(ctx)
+        note(f"Image {image} missing - building (can take a long time)...")
+        t0 = time.time()
+        code, out = _run_logged(cmd, IMAGE_BUILD_TIMEOUT_SEC)
+        if code != 0:
+            return False, f"build of {image} failed (exit {code}): {out[-1500:]}"
+        note(f"Built {image} in {int(time.time() - t0)}s")
+        return True, ""
+
+    fixed = []
+    for svc_name, svc in (cfg.get("services") or {}).items():
+        image = svc.get("image")
+        if image and _docker_image_exists(image):
+            continue
+        if image and image in recipes:
+            ok, msg = build_recipe(image)
+        elif svc.get("build"):
+            note(f"Image for service {svc_name} missing - docker compose build...")
+            code, out = _run_logged(base + ["build", svc_name], IMAGE_BUILD_TIMEOUT_SEC)
+            ok, msg = code == 0, f"compose build {svc_name} failed (exit {code}): {out[-1500:]}"
+        elif image and svc.get("pull_policy") != "never":
+            note(f"Image {image} missing - pulling...")
+            code, out = _run_logged(["docker", "pull", image], IMAGE_BUILD_TIMEOUT_SEC)
+            ok, msg = code == 0, f"pull of {image} failed (exit {code}): {out[-800:]}"
+        else:
+            ok, msg = False, (f"image {image} for service {svc_name} is missing and has no "
+                              f"x-gpu-monitor-images recipe or build section")
+        if not ok:
+            note(msg, "error")
+            return False, msg
+        fixed.append(image or svc_name)
+    return True, ("rebuilt: " + ", ".join(fixed)) if fixed else "all images present"
 
 
 def _run_log_watcher() -> None:
@@ -1469,6 +1593,109 @@ def _parse_prometheus_metrics(raw: str) -> dict:
     return result
 
 
+def _vllm_auth_args() -> list[str]:
+    """curl header args carrying the shared vLLM-stack API key, or [] if there is none."""
+    if VLLM_API_KEY_FILE:
+        try:
+            api_key = Path(VLLM_API_KEY_FILE).read_text(encoding="utf-8").strip()
+            if api_key:
+                return ["-H", f"Authorization: Bearer {api_key}"]
+        except OSError:
+            pass
+    return []
+
+
+def _strata_metrics_to_prometheus(raw: str) -> str:
+    """(2026-09-30) Strata's /metrics is JSON (its own web UI reads it); map it to the vLLM
+    Prometheus names parse_vllm_metrics() reads. Anything that is not JSON passes through.
+
+    Counters come from Strata's lifetime `totals` (updated when a request finishes) plus the
+    in-flight request's `live.generated`, so live T/s moves while a reply is written. Strata
+    runs one generation at a time, so the "pool" is one context window.
+    """
+    if not raw.lstrip().startswith("{"):
+        return raw
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    engine = data.get("engine") or {}
+    live = data.get("live") or {}
+    totals = data.get("totals") or {}
+
+    def num(v) -> float:
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ctx = num(engine.get("context") or engine.get("max_context"))
+    busy = live.get("state") not in (None, "idle")
+    live_gen = num(live.get("generated")) if busy else 0.0
+    # prompt_read counts up during prefill and is None once it answers (whole prompt read)
+    read = live.get("prompt_read")
+    live_read = num(live.get("prompt_tokens") if read is None else read) if busy else 0.0
+    live_total = num(live.get("prompt_total") or live.get("prompt_tokens")) if busy else 0.0
+    # (2026-10-31) v0.2.9 batch slots: live.running counts generating requests (solo or in a
+    # slot); live.waiting/admitting are queued. Older engines: one request, live.queued.
+    if "running" in live:
+        running = num(live.get("running"))
+        waiting = num(live.get("waiting")) + num(live.get("admitting"))
+    else:
+        running = 1.0 if busy else 0.0
+        waiting = num(live.get("queued"))
+    n = num(totals.get("requests"))
+    prompt = num(totals.get("prompt_tokens"))
+    reused = num(totals.get("reused"))
+    out = num(totals.get("output_tokens"))
+    prompt_s = num(totals.get("prompt_ms")) / 1000.0
+    decode_s = num(totals.get("decode_ms")) / 1000.0
+
+    lines = [
+        f"vllm:generation_tokens_total {out + live_gen}",
+        f"vllm:prompt_tokens_total {max(prompt - reused, 0.0)}",
+        f"vllm:prompt_tokens_cached_total {reused}",
+        f"vllm:prefix_cache_queries_total {prompt}",
+        f"vllm:prefix_cache_hits_total {reused}",
+        f"vllm:num_requests_running {running}",
+        f"vllm:num_requests_waiting {waiting}",
+        f"vllm:request_prompt_tokens_sum {prompt}",
+        f"vllm:request_prompt_tokens_count {n}",
+        f"vllm:request_generation_tokens_sum {out}",
+        f"vllm:request_generation_tokens_count {n}",
+        f"vllm:request_prefill_time_seconds_sum {prompt_s}",
+        f"vllm:request_prefill_time_seconds_count {n}",
+        f"vllm:request_decode_time_seconds_sum {decode_s}",
+        f"vllm:request_decode_time_seconds_count {n}",
+        f"vllm:time_to_first_token_seconds_sum {prompt_s}",
+        f"vllm:time_to_first_token_seconds_count {n}",
+        f"vllm:e2e_request_latency_seconds_sum {prompt_s + decode_s}",
+        f"vllm:e2e_request_latency_seconds_count {n}",
+        f"vllm:request_time_per_output_token_seconds_sum {decode_s / out * n if out else 0.0}",
+        f"vllm:request_time_per_output_token_seconds_count {n}",
+        f'vllm:request_success_total{{finished_reason="stop"}} {n}',
+    ]
+    if ctx:
+        used = (live_read + live_gen) if busy else 0.0
+        lines += [
+            f'vllm:cache_config_info{{kv_cache_size_tokens="{int(ctx)}"}} 1',
+            f"vllm:kv_cache_usage_perc {min(used / ctx, 1.0)}",
+        ]
+    if num(engine.get("spec")) > 0 or num(engine.get("mtp_max")) > 0:
+        # MTP drafting is on. v0.2.9 totals carry drafts_offered/drafts_accepted (lifetime,
+        # finished requests); older engines have none, so a present-but-zero counter still
+        # renders "on", not "off". No proposal-round count, so acceptance length stays blank.
+        lines.append(f"vllm:spec_decode_num_draft_tokens_total {num(totals.get('drafts_offered'))}")
+        if "drafts_accepted" in totals:
+            lines.append(f"vllm:spec_decode_num_accepted_tokens_total {num(totals.get('drafts_accepted'))}")
+    if busy:
+        lines += [
+            f"tabby:ctx_live_tokens {live_read + live_gen}",
+            f"tabby:ctx_live_target_tokens {live_total + live_gen}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
 KV_CACHE_SIZE_TOKENS_PATTERN = re.compile(r'kv_cache_size_tokens="(\d+)"')
 
 
@@ -1660,6 +1887,18 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
     offload_read_bytes = get_metric("kv_offload_load_bytes_total") or _sum_labeled_metric(raw, "kv_offload_total_bytes_total") or 0.0
     offload_store_bytes = get_metric("kv_offload_store_bytes_total") or 0.0
     offload_cpu_usage = get_metric("kv_offload_cpu_cache_usage_perc")
+    # Promotions actually performed (CPU tier -> GPU). THE number that says whether the
+    # host tier earns its pinned RAM: bytes can look busy while this stays at 0, which is
+    # exactly the write-only failure the MTP eagle-group bug produced (28 GB stored, 1
+    # load, all of it from a synthetic test). Tracked as a COUNT, not bytes, because a
+    # single large promotion and a steady trickle are different situations.
+    offload_load_count = get_metric("kv_offload_load_size_count") or 0.0
+    # Tier lookup hit rate. vLLM 0.28 dropped external_prefix_cache_{queries,hits}_total
+    # (which is why the "host" figure read blank on this build) in favour of the
+    # per-tier chunk counters.
+    tier_q = _sum_labeled_metric(raw, "kv_offload_tiering_chunk_queries_total") or 0.0
+    tier_h = _sum_labeled_metric(raw, "kv_offload_tiering_chunk_hits_total") or 0.0
+    tier_hit_rate = (tier_h / tier_q) if tier_q > 0 else None
 
     # Terminal states, summed across finished_reason labels, plus the queue-reason split.
     success_by_reason = _labeled_metric_map(raw, "request_success_total", "finished_reason")
@@ -1672,6 +1911,11 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
     # were being parsed and discarded before 2026-08-23.
     requests_running = get_metric("num_requests_running")
     requests_waiting = get_metric("num_requests_waiting")
+    # (2026-09-30) Live per-request context from engines that publish it (the TabbyAPI
+    # shim, tabby_metrics.py): tokens already in the largest in-flight request's KV, which
+    # climbs chunk by chunk during prefill, and that request's full prompt+output size.
+    live_ctx_tokens = parsed.get("tabby:ctx_live_tokens")
+    live_ctx_target = parsed.get("tabby:ctx_live_target_tokens")
 
     # Tokens actually resident in the pool. usage is a fraction OF THE POOL, not of one
     # context window — multiplying it by max_model_len (what the context card used to do)
@@ -1712,6 +1956,25 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
             VLLM_TPS_STATE["container"] = active_key
             VLLM_TPS_STATE["sampled_at"] = now
             VLLM_TPS_STATE["generation_tokens"] = gen_total
+
+    # (2026-09-30) Decode rate of the request(s) that finished since the last scrape, from
+    # the per-request generation-token and decode-time sums. The window rate above is
+    # diluted by idle time around a request's end, which made "last completed" read ~5 T/s.
+    last_request_tps = None
+    req_gen_sum = get_metric("request_generation_tokens_sum")
+    req_decode_sum = get_metric("request_decode_time_seconds_sum")
+    with VLLM_TPS_STATE_LOCK:
+        if VLLM_TPS_STATE.get("req_container") == active_key:
+            d_gen = req_gen_sum - (VLLM_TPS_STATE.get("req_gen_sum") or 0.0)
+            d_dec = req_decode_sum - (VLLM_TPS_STATE.get("req_decode_sum") or 0.0)
+            if d_gen > 0 and d_dec > 0:
+                VLLM_TPS_STATE["last_request_tps"] = d_gen / d_dec
+            last_request_tps = VLLM_TPS_STATE.get("last_request_tps")
+        else:
+            VLLM_TPS_STATE["last_request_tps"] = None
+        VLLM_TPS_STATE["req_container"] = active_key
+        VLLM_TPS_STATE["req_gen_sum"] = req_gen_sum
+        VLLM_TPS_STATE["req_decode_sum"] = req_decode_sum
 
     # Compute live ingest TPS.
     # Divide the prompt-token delta by the delta of vLLM's own PREFILL phase time, not by
@@ -1776,6 +2039,9 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
         "kv_max_concurrency": kv_max_concurrency,
         "requests_running": requests_running,
         "requests_waiting": requests_waiting,
+        "live_ctx_tokens": live_ctx_tokens,
+        "last_request_tps": last_request_tps,
+        "live_ctx_target": live_ctx_target,
         "avg_tpot_sec": avg_tpot_sec,
         "avg_output_rate_tps": avg_output_rate_tps,
         "avg_prefill_rate_tps": avg_prefill_rate_tps,
@@ -1783,7 +2049,9 @@ def parse_vllm_metrics(raw: str, active_key: str) -> dict:
         "avg_itl_sec": avg_itl_sec,
         "prefix_hit_rate": prefix_hit_rate,
         "prefix_queries": prefix_q or None,
-        "external_prefix_hit_rate": ext_hit_rate,
+        "external_prefix_hit_rate": ext_hit_rate if ext_hit_rate is not None else tier_hit_rate,
+        "offload_load_count": offload_load_count or None,
+        "offload_tier_queries": tier_q or None,
         "prompt_tokens_cached": prompt_cached or None,
         "prompt_cached_frac": prompt_cached_frac,
         "preemptions": preemptions,
@@ -2140,20 +2408,69 @@ def build_vllm_throughput_status() -> dict:
             "avg_prompt_per_request": None,
         }
 
+    # ⭐ NEVER SCRAPE ON THE REQUEST PATH (2026-09-27). TabbyAPI stops answering HTTP
+    # while it prefills a long prompt: /metrics was measured at 0.35-7 s routinely and
+    # 42.8 s once, during a 32K-token agent turn. Scraped inline, every /api/status poll
+    # waited on it (up to the 5 s curl cap plus ~1 s of docker exec on a loaded host), and
+    # the whole dashboard froze. Now the poll always answers from the last good scrape
+    # and, if that is stale, starts ONE background scrape. `gauge_age_sec` says how old
+    # the numbers are.
     now = time.time()
     with VLLM_METRICS_CACHE_LOCK:
-        cached = VLLM_METRICS_CACHE["raw"]
-        if (
-            cached is not None
-            and VLLM_METRICS_CACHE["container"] == container
-            and (now - VLLM_METRICS_CACHE["checked_at"]) < VLLM_METRICS_CACHE_TTL_SEC
-        ):
-            return _build_vllm_throughput_from_cache(container)
+        stale = (VLLM_METRICS_CACHE["container"] != container
+                 or (now - VLLM_METRICS_CACHE["checked_at"]) >= VLLM_METRICS_CACHE_TTL_SEC)
+        start = stale and not VLLM_METRICS_SCRAPE["running"]
+        if start:
+            VLLM_METRICS_SCRAPE["running"] = True
+        same_container = VLLM_METRICS_CACHE["container"] == container
+    if start:
+        threading.Thread(target=_scrape_vllm_metrics_bg, args=(container,),
+                         daemon=True, name="vllm-metrics-scrape").start()
+    if not same_container:
+        # A different engine than the cached one: its old numbers would be wrong, so report
+        # "collecting" until the first scrape of this container lands.
+        return {
+            "tokens_per_second": None,
+            "ingest_tps": None,
+            "source": "prometheus",
+            "updated_at": now_iso(),
+            "container": container,
+            "state": "collecting",
+            "detail": "No vLLM metrics scraped yet",
+            "generation_tokens_total": 0,
+            "prompt_tokens_total": 0,
+            "avg_queue_time_sec": None,
+            "avg_ttft_sec": None,
+            "avg_iter_tokens": None,
+            "avg_gen_per_request": None,
+            "avg_prompt_per_request": None,
+        }
+    with VLLM_METRICS_CACHE_LOCK:
+        return _build_vllm_throughput_from_cache(container)
 
+
+def _scrape_vllm_metrics_bg(container: str) -> None:
+    try:
+        _scrape_vllm_metrics(container)
+    except Exception as exc:  # noqa: BLE001
+        _append_log_event("warning", "metrics", f"vLLM metrics scrape failed: {exc}")
+    finally:
+        with VLLM_METRICS_CACHE_LOCK:
+            VLLM_METRICS_SCRAPE["running"] = False
+
+
+def _scrape_vllm_metrics(container: str) -> dict:
+    """Scrape and parse the engine's /metrics once and store it in VLLM_METRICS_CACHE.
+
+    Runs on the background scrape thread only; see build_vllm_throughput_status().
+    """
     code, output = run_command(
-        ["docker", "exec", container, "curl", "-fsS", "--max-time", "5",
+        ["docker", "exec", container, "curl", "-fsS", "--max-time", "20", *_vllm_auth_args(),
          "http://127.0.0.1:8080/metrics"]
     )
+    if code == 0:
+        output = _strata_metrics_to_prometheus(output)
+    now = time.time()
     if code != 0:
         result = {
             "tokens_per_second": None,
@@ -2196,6 +2513,8 @@ def build_vllm_throughput_status() -> dict:
             "kv_max_concurrency": parsed["kv_max_concurrency"],
             "requests_running": parsed["requests_running"],
             "requests_waiting": parsed["requests_waiting"],
+            "live_ctx_tokens": parsed.get("live_ctx_tokens"),
+            "live_ctx_target": parsed.get("live_ctx_target"),
             "avg_tpot_sec": parsed["avg_tpot_sec"],
             "avg_output_rate_tps": parsed["avg_output_rate_tps"],
             "avg_prefill_rate_tps": parsed["avg_prefill_rate_tps"],
@@ -2208,11 +2527,14 @@ def build_vllm_throughput_status() -> dict:
                 "external_prefix_hit_rate", "prompt_tokens_cached", "prompt_cached_frac",
                 "preemptions", "spec_present", "spec_accept_rate", "spec_accept_len",
                 "spec_draft_tokens", "offload_read_bytes", "offload_store_bytes",
+                "offload_load_count", "offload_tier_queries",
                 "offload_cpu_usage_perc", "success_by_reason", "waiting_by_reason",
+                "last_request_tps",
             )},
         }
 
     with VLLM_METRICS_CACHE_LOCK:
+        prev_container = VLLM_METRICS_CACHE["container"]
         VLLM_METRICS_CACHE["container"] = container
         VLLM_METRICS_CACHE["checked_at"] = now
         if code == 0:
@@ -2227,8 +2549,12 @@ def build_vllm_throughput_status() -> dict:
             # dict"). This is that fix — do not go back to enumerating fields here.
             VLLM_METRICS_CACHE["result"] = result
         else:
+            # Keep the last good result: a scrape that timed out during a prefill stall
+            # says nothing new about the engine, and blanking the cards is what made the
+            # dashboard look dead. gauge_age_sec keeps growing, so staleness stays visible.
             VLLM_METRICS_CACHE["raw"] = None
-            VLLM_METRICS_CACHE["result"] = None
+            if prev_container != container:
+                VLLM_METRICS_CACHE["result"] = None
 
     return result
 
@@ -2275,6 +2601,8 @@ def _build_vllm_throughput_from_cache(container: str) -> dict:
             "kv_max_concurrency": None,
             "requests_running": None,
             "requests_waiting": None,
+            "live_ctx_tokens": None,
+            "live_ctx_target": None,
         }
 
     result = dict(stored)
@@ -2354,11 +2682,14 @@ def build_model_stats(active_key: str | None, live: dict, completed: dict) -> di
             if stats["best_ingest_tps"] is None or float(ingest_live_tps) > stats["best_ingest_tps"]:
                 stats["best_ingest_tps"] = float(ingest_live_tps)
 
-        completion_tps = completed.get("tokens_per_second")
+        completion_tps = completed.get("last_request_tps") or completed.get("tokens_per_second")
         completion_ingest = completed.get("ingest_tps")
         completion_key = completed.get("completion_key")
+        # (2026-09-30) "cached" too: status polls are served from the background scrape's
+        # cache, so a vLLM-family reading is almost never "ok" and this never fired.
+        # completion_key (the finished-request count) already dedups repeats.
         should_add_completion = (
-            completed.get("state") == "ok"
+            completed.get("state") in ("ok", "cached")
             and isinstance(completion_tps, (int, float))
             and completion_key is not None
             and completion_key != stats["last_completed_completion_key"]
@@ -2440,6 +2771,167 @@ BENCHMARK_FILLER_WORDS = (
     "number season picture street corner branch circle island valley"
 ).split()
 
+# ── Realistic benchmark context (added 2026-09-20) ───────────────────────────
+# The original prompt padded with random high-entropy words. That was a considered
+# choice, not an oversight: a prompt of one repeated token, or of prose the model
+# then copies back, is a best case for speculative decoding and inflates reported
+# generation throughput. This block keeps that ANTI-COPY GUARD -- every task asks
+# for something the context does not contain -- while making the context real text
+# in three registers, so the profile covers general prose, code and chat rather
+# than one synthetic distribution. Keep the guard when editing these.
+#
+# ⚠️ WHAT THIS DOES AND DOES NOT BUY, all MEASURED on Swift-Qwen3.8-27B with MTP,
+# fixed 1024-token prompt and 512 generated tokens, /v1/completions + ignore_eos
+# (the harness's own request shape), idle box:
+#
+#     opaque filler  + essay task (the old prompt)      49.0% acceptance
+#     real context   + essay task                       50.5%
+#     real context   + ordinary answer task (SHIPS)     52.2%
+#     short question, no padding at all                 58.5%
+#
+# So realistic context is worth about +1.5 points of draft acceptance and an
+# ordinary "answer this" task another +1.7. Both are real, both are small.
+# ⛔ What dominates is PROMPT LENGTH, not padding content: the same model on short
+# unpadded questions accepts 58.5% against ~50% on any 1024-token padded prompt.
+# A padded benchmark prompt therefore reports decode throughput BELOW what short
+# real requests get, and no choice of filler text fixes that -- it is inherent to
+# measuring long-prompt behaviour. Do not read the full profile's acceptance as
+# "the model's acceptance rate"; read it as acceptance at that prompt length.
+# (An earlier version of this comment blamed opaque filler for the whole gap. It
+# was wrong: filler accounts for ~1.5 points of roughly nine.)
+#
+# ⚠️ COMPARABILITY: numbers recorded before 2026-09-20 used kind="filler" with the
+# essay task and are NOT comparable with the realistic kinds. kind="filler" is
+# retained so an old measurement can be reproduced deliberately.
+#
+# Units are sampled WITHOUT replacement in a seeded order and only reshuffled once
+# exhausted, so a large prompt repeats material but never adjacently. The pools are
+# deliberately small enough to keep this file self-contained: dashboard-server.py is
+# baked into the image, so it cannot read a corpus off disk -- and a code change here
+# needs `docker compose up -d --build`, since a restart alone keeps the old copy.
+
+BENCHMARK_CONTEXT_GENERAL = [
+    "The storage tier was provisioned for throughput, not latency, and the difference only became visible under mixed read and write load.",
+    "Each regional office kept its own copy of the pricing table, which is how three different answers to the same question reached the customer.",
+    "We assumed the queue drained faster than it filled, and for eleven months that assumption held.",
+    "The migration plan called for a read-only window of four hours; the actual cutover took nineteen minutes and nobody believed the dashboard.",
+    "Procurement rejected the first proposal because the warranty terms did not cover drives that failed inside the first ninety days.",
+    "Support tickets clustered around Monday mornings, which turned out to reflect a weekly batch job rather than user behaviour.",
+    "The report distinguished between capacity that exists and capacity that can be reached without a restart, and only the second number mattered.",
+    "Two teams measured the same endpoint and disagreed by a factor of three, because one of them counted queue time and the other did not.",
+    "The vendor benchmark used a working set that fit entirely in cache, which is a legitimate configuration and a misleading headline.",
+    "After the reorganisation the on-call rotation covered nine services with six people, and the escalation policy was never updated to match.",
+    "Compliance required an audit trail for every schema change, so the team wrote a migration tool that refused to run without a ticket reference.",
+    "The forecast was revised downward twice, both times because a single large contract slipped a quarter.",
+    "Latency at the ninety-ninth percentile was four times the median, and the median was the only figure in the quarterly review.",
+    "The cache hit rate improved after deployment, but so did the error rate, and the two turned out to share a cause.",
+    "Field engineers carried a spare power supply because the failure they actually saw was never the one the manual described.",
+    "A postmortem is useful in proportion to how specific it is about what was believed at the time, not about what is obvious afterwards.",
+    "The contract specified availability per calendar month, which meant a six-hour outage on the thirty-first was cheaper than one on the first.",
+    "Inventory turnover looked healthy in aggregate and terrible once seasonal lines were separated out.",
+    "The new index made the reporting query fast and the ingest path noticeably slower, which surprised nobody who had read the write path.",
+    "Training materials were rewritten after it became clear most errors came from a single ambiguous field label.",
+    "The board asked for one number; the honest answer required three, and the compromise was a footnote nobody read.",
+    "Retention improved in the cohort that received slower but more accurate responses, which contradicted the original hypothesis.",
+    "Because the retry policy was exponential but unbounded, a brief upstream failure produced traffic for the next forty minutes.",
+    "The building's cooling capacity, not the power budget, set the practical limit on how many racks could be populated.",
+    "Every estimate in the plan was a median with no stated spread, so the schedule had no slack anywhere in it.",
+    "The data was correct, the aggregation was correct, and the label on the axis was wrong, which is the hardest class of error to catch.",
+    "Rolling back the configuration restored service in under a minute and destroyed the evidence needed to explain the incident.",
+    "Suppliers quoted lead times in weeks and delivered in months, so the team learned to order against the pessimistic figure.",
+    "The audit found no unauthorised access and considerable unnecessary access, which is a finding worth acting on.",
+    "Demand was elastic below a threshold price and almost perfectly inelastic above it, which made the pricing experiment cheap to run.",
+    "Documentation described the intended behaviour; the tests described the actual behaviour; the two had diverged over about two years.",
+    "Because the clocks drifted, events arrived out of order and the deduplication logic silently discarded the newer record.",
+    "The pilot succeeded partly because the team running it had written the tool and knew which paths to avoid.",
+    "Capacity planning based on peak-to-mean ratios worked until a marketing campaign changed the shape of the traffic entirely.",
+    "The simplest explanation for the discrepancy was a unit error, and after two days of analysis that is exactly what it was.",
+    "Maintenance windows were negotiated annually, which meant urgent work waited and routine work was done under pressure.",
+]
+
+BENCHMARK_CONTEXT_CODE = [
+    'def load_config(path, defaults=None):\n    """Read a JSON config, layering it over defaults."""\n    cfg = dict(defaults or {})\n    try:\n        with open(path) as fh:\n            cfg.update(json.load(fh))\n    except FileNotFoundError:\n        pass\n    except json.JSONDecodeError as exc:\n        raise ValueError(f"{path}: {exc}") from exc\n    return cfg',
+    'class RingBuffer:\n    def __init__(self, capacity):\n        if capacity <= 0:\n            raise ValueError("capacity must be positive")\n        self._buf = [None] * capacity\n        self._head = 0\n        self._len = 0\n\n    def append(self, item):\n        self._buf[(self._head + self._len) % len(self._buf)] = item\n        if self._len < len(self._buf):\n            self._len += 1\n        else:\n            self._head = (self._head + 1) % len(self._buf)\n\n    def __len__(self):\n        return self._len',
+    'def retry(fn, attempts=5, base=0.1, cap=5.0):\n    last = None\n    for i in range(attempts):\n        try:\n            return fn()\n        except TransientError as exc:\n            last = exc\n            time.sleep(min(cap, base * (2 ** i)) * (0.5 + random.random()))\n    raise last',
+    'def percentile(values, q):\n    if not values:\n        return None\n    ordered = sorted(values)\n    idx = (len(ordered) - 1) * (q / 100.0)\n    lo = math.floor(idx)\n    hi = math.ceil(idx)\n    if lo == hi:\n        return ordered[int(idx)]\n    return ordered[lo] * (hi - idx) + ordered[hi] * (idx - lo)',
+    'async def fan_out(urls, limit=8):\n    sem = asyncio.Semaphore(limit)\n\n    async def fetch(session, url):\n        async with sem:\n            async with session.get(url, timeout=30) as resp:\n                resp.raise_for_status()\n                return url, await resp.json()\n\n    async with aiohttp.ClientSession() as session:\n        return await asyncio.gather(*(fetch(session, u) for u in urls), return_exceptions=True)',
+    'def merge_intervals(intervals):\n    out = []\n    for start, end in sorted(intervals):\n        if out and start <= out[-1][1]:\n            out[-1] = (out[-1][0], max(out[-1][1], end))\n        else:\n            out.append((start, end))\n    return out',
+    'CREATE TABLE benchmarks (\n  id        INTEGER PRIMARY KEY,\n  ts        REAL    NOT NULL,\n  profile   TEXT    NOT NULL,\n  model_key TEXT    NOT NULL,\n  success   INTEGER NOT NULL DEFAULT 0,\n  gen_tps   REAL,\n  UNIQUE (model_key, ts)\n);\nCREATE INDEX idx_benchmarks_model ON benchmarks (model_key, success, ts DESC);',
+    'def parse_prometheus(text):\n    out = {}\n    for line in text.splitlines():\n        if not line or line.startswith("#"):\n            continue\n        name, _, value = line.rpartition(" ")\n        base = name.split("{", 1)[0]\n        try:\n            out.setdefault(base, []).append(float(value))\n        except ValueError:\n            continue\n    return out',
+    'function debounce(fn, waitMs) {\n  let timer = null;\n  return (...args) => {\n    if (timer !== null) clearTimeout(timer);\n    timer = setTimeout(() => {\n      timer = null;\n      fn(...args);\n    }, waitMs);\n  };\n}',
+    'def chunked(iterable, size):\n    if size < 1:\n        raise ValueError("size must be >= 1")\n    it = iter(iterable)\n    while True:\n        batch = list(itertools.islice(it, size))\n        if not batch:\n            return\n        yield batch',
+    '@dataclass(frozen=True)\nclass RunResult:\n    name: str\n    prompt_tokens: int\n    gen_tokens: int\n    prompt_ms: float\n    gen_ms: float\n\n    @property\n    def gen_tps(self) -> float:\n        return self.gen_tokens / (self.gen_ms / 1000.0) if self.gen_ms else 0.0',
+    # Short units: a single function is a coarse packing quantum, and without
+    # something smaller a 512-token code prompt lands ~14% under target.
+    'def clamp(x, lo, hi):\n    return lo if x < lo else hi if x > hi else x',
+    'def human_bytes(n):\n    for unit in ("B", "KiB", "MiB", "GiB"):\n        if abs(n) < 1024:\n            return f"{n:.1f}{unit}"\n        n /= 1024\n    return f"{n:.1f}TiB"',
+    'export const sleep = (ms) => new Promise((res) => setTimeout(res, ms));',
+    'SELECT model_key, COUNT(*) AS runs, AVG(gen_tps) AS mean_tps\n  FROM benchmarks\n WHERE success = 1\n GROUP BY model_key\n ORDER BY mean_tps DESC;',
+    'def is_power_of_two(n):\n    return n > 0 and (n & (n - 1)) == 0',
+    'def bisect_left(a, x, lo=0, hi=None):\n    if hi is None:\n        hi = len(a)\n    while lo < hi:\n        mid = (lo + hi) // 2\n        if a[mid] < x:\n            lo = mid + 1\n        else:\n            hi = mid\n    return lo',
+]
+
+BENCHMARK_CONTEXT_CHAT = [
+    "User: The nightly export finished but the row count is about 12% lower than yesterday. Where should I look first?\nAssistant: Compare the source query's date filter against the job's start time. A job that now starts before midnight in local time will clip the last partition.",
+    "User: We set max_connections to 400 and the pool still exhausts under load.\nAssistant: Check whether the limit is per process. With eight workers each holding its own pool, the effective ceiling is the per-worker size, not the server setting.",
+    "User: Can I run the migration without taking the service down?\nAssistant: Adding a nullable column is safe online. Backfilling it in one statement is not, because it takes a lock for the duration; batch the backfill instead.",
+    "User: Our p99 doubled after the deploy but the median is unchanged.\nAssistant: That pattern usually means a new slow path on a minority of requests rather than a general regression. Group latency by endpoint and by cache hit or miss.",
+    "User: Should we store timestamps as text or integers?\nAssistant: Store them as an explicit timestamp type with a timezone if the database has one. Integers are compact but every consumer then reimplements the conversion, usually inconsistently.",
+    "User: The retry storm took down the upstream again.\nAssistant: Bound the total retry window and add jitter. Unbounded exponential backoff still produces a long tail of traffic after a brief failure.",
+    "User: How big should the batch be for the nightly reindex?\nAssistant: Size it by wall time rather than row count, targeting a few seconds per batch, so the job adapts when rows get wider.",
+    "User: Two services disagree about the customer's balance.\nAssistant: Establish which one owns the value. If both write it, the disagreement is a design outcome, not a bug to be patched.",
+    "User: Is it worth adding an index for this report?\nAssistant: Measure the write cost first. A reporting query run four times a day rarely justifies slowing every insert.",
+    "User: The container gets OOM killed but the process shows low RSS.\nAssistant: Page cache and tmpfs count against the cgroup limit. Check memory.current and memory.stat rather than the process's own RSS.",
+    "User: Can we cache this endpoint?\nAssistant: Only if the response is a function of the request alone. Anything that depends on the caller's permissions needs the identity in the cache key or it will leak.",
+    "User: Our deploy rolled back automatically and we lost the logs.\nAssistant: Ship logs off the instance before the rollback completes, or keep the failed instance quarantined instead of terminating it.",
+    "User: Why is the first request after a deploy so slow?\nAssistant: Cold caches, lazy connection pools and JIT or graph compilation all land on that request. Warm the path in the readiness check.",
+    "User: We want exactly-once processing.\nAssistant: Aim for at-least-once delivery with idempotent handlers. Exactly-once across a network boundary requires coordination most pipelines cannot afford.",
+    "User: The backup completes but the restore test fails.\nAssistant: Then the backup is not verified and should not be counted as one. Restore into a scratch environment as part of the schedule.",
+    "User: How do I pick a timeout for this call?\nAssistant: Base it on the downstream's measured p99 plus headroom, and make sure it is shorter than the caller's own timeout, otherwise retries pile up behind a request nobody is waiting for.",
+]
+
+# Wrapper + task instruction cost, MEASURED with the Qwen3.8 tokenizer 2026-09-20,
+# per kind because the instructions differ in length. The legacy filler path keeps
+# using BENCHMARK_PROMPT_OVERHEAD_TOKENS so its historical sizing is untouched.
+# The per-unit estimators below are calibrated against the same tokenizer: with
+# these values a requested 4096-token prompt lands within a few percent, against
+# the 11% undershoot the first uncalibrated guess produced. Re-measure if the
+# instructions or the pools change materially.
+BENCHMARK_CONTEXT_OVERHEAD_TOKENS = {"general": 90, "code": 91, "chat": 87}
+
+# Per kind: (units, tokens-per-unit estimator, context label, task instruction).
+# The task always asks for material the context does NOT supply, so the model must
+# generate rather than copy. See the note above before changing these.
+BENCHMARK_CONTEXT_KINDS = {
+    "general": (
+        BENCHMARK_CONTEXT_GENERAL,
+        lambda u: len(u.split()) * 1.20,
+        "NOTES",
+        "TASK: Using the notes above as background, answer this for a new team "
+        "member: when is it better to buy more capacity than to optimise what we "
+        "already run? Explain your reasoning. Do not quote or restate the notes.\n\n"
+        "ANSWER:\n",
+    ),
+    "code": (
+        BENCHMARK_CONTEXT_CODE,
+        lambda u: len(u) / 3.37,
+        "SOURCE",
+        "TASK: Using the source above as background, answer this for a colleague: "
+        "how should we structure retries for background jobs that touch a shared "
+        "database? Cover interfaces and failure handling, and explain your reasoning. "
+        "Do not quote or restate the source.\n\nANSWER:\n",
+    ),
+    "chat": (
+        BENCHMARK_CONTEXT_CHAT,
+        lambda u: len(u.split()) * 1.33,
+        "TRANSCRIPT",
+        "TASK: Using the transcript above as background, answer this question from a "
+        "new on-call engineer: what should I check first when latency rises after a "
+        "deploy? Explain your reasoning. Do not quote or restate the transcript.\n\n"
+        "ANSWER:\n",
+    ),
+}
+
 BENCHMARK_TOKENS_PER_FILLER_WORD = 1.0
 
 # Instruction wrapper is ~75 tokens; subtract it so the requested prompt size is roughly honoured.
@@ -2452,32 +2944,78 @@ BENCHMARK_TASK_INSTRUCTION = (
 )
 
 
-def build_benchmark_prompt(estimated_tokens: int, seed: int = 0, nonce: str = "") -> str:
+def build_benchmark_prompt(
+    estimated_tokens: int, seed: int = 0, nonce: str = "", kind: str = "general"
+) -> str:
     """Build a benchmark prompt that produces *representative* generation work.
 
-    A prompt of one repeated token (the previous implementation) is a pathological
-    best case for speculative decoding: the drafter predicts every token, acceptance
-    hits ~100%, and reported generation throughput lands several times above what any
-    real request sees. Likewise, padding the prompt with coherent prose makes the model
-    copy that prose back, which the drafter also predicts perfectly.
+    A prompt of one repeated token is a pathological best case for speculative
+    decoding: the drafter predicts every token and reported throughput lands
+    several times above what any real request sees. Padding with prose the model
+    then copies back has the same effect. Opaque random filler avoids both, but
+    overshoots into the worst case instead and understates decode throughput --
+    see the note above BENCHMARK_CONTEXT_GENERAL for the measured gap.
 
-    So: high-entropy filler the model is told to ignore, plus a real instruction that
-    forces novel text. Deterministic per (estimated_tokens, seed) so runs are comparable.
+    So: real text as background context, plus a task that demands novel output
+    about something the context does not cover. kind selects the register the
+    context comes from ("general", "code", "chat"); kind="filler" reproduces the
+    pre-2026-09-20 opaque-filler prompt for comparison with old numbers.
+
+    Deterministic per (estimated_tokens, seed, kind) so runs are comparable.
     """
-    pad_tokens = max(0, estimated_tokens - BENCHMARK_PROMPT_OVERHEAD_TOKENS)
-    word_count = max(16, int(round(pad_tokens / BENCHMARK_TOKENS_PER_FILLER_WORD)))
-    rnd = random.Random(seed * 7919 + estimated_tokens)
-    filler = " ".join(rnd.choice(BENCHMARK_FILLER_WORDS) for _ in range(word_count))
+    overhead = BENCHMARK_CONTEXT_OVERHEAD_TOKENS.get(kind, BENCHMARK_PROMPT_OVERHEAD_TOKENS)
+    pad_tokens = max(0, estimated_tokens - overhead)
+    # kind is folded into the seed so the same (tokens, seed) pair does not hand
+    # every register an identically ordered context.
+    rnd = random.Random(seed * 7919 + estimated_tokens + (zlib.crc32(kind.encode()) % 100003))
+
+    if kind == "filler":
+        legacy_pad = max(0, estimated_tokens - BENCHMARK_PROMPT_OVERHEAD_TOKENS)
+        word_count = max(16, int(round(legacy_pad / BENCHMARK_TOKENS_PER_FILLER_WORD)))
+        filler = " ".join(rnd.choice(BENCHMARK_FILLER_WORDS) for _ in range(word_count))
+        prefix = f"RUN-ID {nonce}\n" if nonce else ""
+        return (
+            prefix
+            + "You are a throughput benchmark harness. The block below is opaque filler. "
+            "Do not read, repeat, quote, or refer to it.\n\nFILLER:\n"
+            + filler
+            + "\n\n"
+            + BENCHMARK_TASK_INSTRUCTION
+        )
+
+    units, est, label, instruction = BENCHMARK_CONTEXT_KINDS.get(
+        kind, BENCHMARK_CONTEXT_KINDS["general"]
+    )
+    # Sample without replacement, reshuffling only once the pool is exhausted, so a
+    # large prompt repeats material but never places the same unit twice in a row.
+    chosen: list[str] = []
+    budget = 0.0
+    bag: list[str] = []
+    while budget < pad_tokens:
+        if not bag:
+            bag = list(units)
+            rnd.shuffle(bag)
+        unit = bag.pop()
+        cost = est(unit)
+        # Small targets: one unit can exceed the whole budget. Take it only if we
+        # have nothing yet, or if it lands closer to the target than stopping does.
+        if chosen and budget + cost - pad_tokens > pad_tokens - budget:
+            break
+        chosen.append(unit)
+        budget += cost
     # The nonce sits at the very front so no block of the prompt can be served from a
     # prefix cache. A cached prefill measures cache lookup speed, not ingest speed.
     prefix = f"RUN-ID {nonce}\n" if nonce else ""
+    joiner = "\n\n" if kind == "code" else "\n"
     return (
         prefix
-        + "You are a throughput benchmark harness. The block below is opaque filler. "
-        "Do not read, repeat, quote, or refer to it.\n\nFILLER:\n"
-        + filler
+        + "You are a throughput benchmark harness. The block below is background "
+        "material. Use it only as context; do not quote or repeat it.\n\n"
+        + label
+        + ":\n"
+        + joiner.join(chosen)
         + "\n\n"
-        + BENCHMARK_TASK_INSTRUCTION
+        + instruction
     )
 
 
@@ -2505,6 +3043,7 @@ def _vllm_phase_snapshot(container: str, port: int, auth_args: list[str]) -> dic
     ])
     if code != 0:
         return None
+    out = _strata_metrics_to_prometheus(out)
     parsed = _parse_prometheus_metrics(out)
 
     def g(name: str) -> float:
@@ -2527,6 +3066,7 @@ def run_single_benchmark(
     prompt_tokens: int,
     n_predict: int,
     seed: int = 0,
+    kind: str = "general",
 ) -> tuple[dict | None, str | None]:
     container = find_model_server_container_name(active_key, containers)
     if not container:
@@ -2568,7 +3108,9 @@ def run_single_benchmark(
         # to the server's own configuration so the benchmark reflects real serving settings.
         payload = {
             "model": model_id,
-            "prompt": build_benchmark_prompt(prompt_tokens, seed, nonce=uuid.uuid4().hex[:16]),
+            "prompt": build_benchmark_prompt(
+                prompt_tokens, seed, nonce=uuid.uuid4().hex[:16], kind=kind
+            ),
             "max_tokens": n_predict,
             "min_tokens": n_predict,
             "ignore_eos": True,
@@ -2576,12 +3118,30 @@ def run_single_benchmark(
             "stream_options": {"include_usage": True}
         }
         endpoint = f"http://127.0.0.1:{port}/v1/completions"
+
+        # (2026-09-30) Strata has no /v1/completions: chat API instead, thinking off. It has no
+        # ignore_eos either, so the generated count can end short of n_predict (usage reports
+        # the real count). Recognised by its JSON /metrics.
+        code_m, out_m = run_command([
+            "docker", "exec", container, "curl", "-fsS", "--max-time", "5", *auth_args,
+            f"http://127.0.0.1:{port}/metrics",
+        ])
+        if code_m == 0 and out_m.lstrip().startswith("{") and '"engine"' in out_m:
+            payload = {
+                "model": model_id,
+                "messages": [{"role": "user", "content": payload["prompt"]}],
+                "max_tokens": n_predict,
+                "reasoning_effort": "none",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            endpoint = f"http://127.0.0.1:{port}/v1/chat/completions"
     else:
         # llama.cpp / BeeLlama completions API.
         # cache_prompt=False defeats the prompt cache so prefill is actually measured;
         # ignore_eos pins predicted_n to n_predict. Sampling is left to the server config.
         payload = {
-            "prompt": build_benchmark_prompt(prompt_tokens, seed),
+            "prompt": build_benchmark_prompt(prompt_tokens, seed, kind=kind),
             "n_predict": n_predict,
             "ignore_eos": True,
             "stream": False,
@@ -2637,6 +3197,7 @@ def run_single_benchmark(
     if is_vllm:
         # vLLM streaming usage format (it's in the last data chunk)
         usage = None
+        stream_timings = None   # llama.cpp-style per-request timings (Strata's last chunk)
         # body in this case is the list of lines if it was a stream? 
         # No, body = json.loads(output) likely failed because output is a stream.
         # Let's fix the JSON loading for vLLM streams.
@@ -2661,6 +3222,8 @@ def run_single_benchmark(
                 continue
             if isinstance(_chunk, dict) and _chunk.get("usage"):
                 usage = _chunk["usage"]
+            if isinstance(_chunk, dict) and isinstance(_chunk.get("timings"), dict):
+                stream_timings = _chunk["timings"]
         
         if not usage:
             # Fallback to common choice-based usage if available
@@ -2704,6 +3267,22 @@ def run_single_benchmark(
             if d_queries > 0:
                 cache_hit_ratio = d_hits / d_queries
 
+        # (2026-09-30) Strata reports this request's own phase times and MTP draft counts in
+        # its final chunk: exact, and immune to other traffic, so they win over the deltas.
+        draft_n = draft_accepted = None
+        if stream_timings:
+            p_ms, d_ms = stream_timings.get("prompt_ms"), stream_timings.get("predicted_ms")
+            if isinstance(p_ms, (int, float)) and p_ms > 0 and isinstance(d_ms, (int, float)) and d_ms > 0:
+                prefill_sec, decode_sec = p_ms / 1000.0, d_ms / 1000.0
+                prompt_n = stream_timings.get("prompt_n") or prompt_n
+                gen_n = stream_timings.get("predicted_n") or gen_n
+                timing_source = "strata_timings"
+                cached_n = stream_timings.get("cache_n") or 0
+                if prompt_n + cached_n > 0:
+                    cache_hit_ratio = cached_n / (prompt_n + cached_n)
+            draft_n = stream_timings.get("draft_n")
+            draft_accepted = stream_timings.get("draft_n_accepted")
+
         if prefill_sec is None:
             # Fallback: wall duration minus measured decode, else the old TTFT estimate.
             timing_source = "wall_clock_fallback"
@@ -2735,6 +3314,9 @@ def run_single_benchmark(
                 "ttft_sec": ttft,
                 "prefix_cache_hit_ratio": cache_hit_ratio,
                 "timing_source": timing_source,
+                "draft_n": draft_n,
+                "draft_n_accepted": draft_accepted,
+                "draft_acceptance": (draft_accepted / draft_n) if draft_n and draft_accepted is not None else None,
             },
             None,
         )
@@ -2807,19 +3389,24 @@ def run_benchmark_profile(
         for idx, spec in enumerate(specs, start=1):
             for rep in range(repeats):
                 if callable(progress_cb):
-                    progress_cb(f"full benchmark: pass {idx}/{len(specs)} ({spec['name']}, run {rep + 1}/{repeats})...")
+                    progress_cb(
+                        f"full benchmark: pass {idx}/{len(specs)} "
+                        f"({spec['name']}/{spec.get('kind', 'general')}, run {rep + 1}/{repeats})..."
+                    )
                 run, error = run_single_benchmark(
                     active_key,
                     containers,
                     prompt_tokens=spec["prompt_tokens"],
                     n_predict=spec["n_predict"],
                     seed=rep,
+                    kind=spec.get("kind", "general"),
                 )
                 if error:
                     return None, f"Full benchmark failed on {spec['name']} (run {rep + 1}/{repeats}): {error}"
                 run["name"] = f"{spec['name']}#{rep + 1}"
                 run["requested_prompt_tokens"] = spec["prompt_tokens"]
                 run["requested_n_predict"] = spec["n_predict"]
+                run["kind"] = spec.get("kind", "general")
                 runs.append(run)
 
         prompt_tokens_total = sum(int(r.get("prompt_tokens") or 0) for r in runs)
@@ -2899,10 +3486,24 @@ def start_switch(model_key: str) -> tuple[bool, str]:
     def _worker() -> None:
         switch_started_ts = time.time()
         try:
+            # (2026-11-02) Build missing images FIRST, while the current stack still serves;
+            # only then stop BeeLlama / let switch-llm.sh down the old stack.
+            compose_path = model["compose"]
+
+            def _img_status(msg: str) -> None:
+                with STATE_LOCK:
+                    STATE["last_message"] = msg
+
+            img_ok, img_msg = ensure_stack_images(compose_path, cwd=LLAMA_DIR, status_cb=_img_status)
+            if not img_ok:
+                with STATE_LOCK:
+                    STATE["last_exit_code"] = 1
+                    STATE["last_output"] = img_msg[-4000:]
+                _clear_switch_state(f"Image build failed for {model['label']}: {img_msg[:120]}")
+                return
             # Stop BeeLlama if running before starting a llama.cpp model
             if BEELLAMA_DIR.is_dir():
                 _stop_beellama()
-            compose_path = model["compose"]
             cmd = [
                 "bash",
                 "-lc",
@@ -3034,6 +3635,18 @@ def start_vllm_switch(
     def _vllm_worker() -> None:
         switch_started_ts = time.time()
         try:
+            # (2026-11-02) Rebuild missing images while the current stack still serves.
+            def _img_status(msg: str) -> None:
+                with STATE_LOCK:
+                    STATE["last_message"] = msg
+
+            img_ok, img_msg = ensure_stack_images(Path(compose_file), project="vllm", cwd=VLLM_DIR, status_cb=_img_status)
+            if not img_ok:
+                with STATE_LOCK:
+                    STATE["last_exit_code"] = 1
+                    STATE["last_output"] = img_msg[-4000:]
+                _clear_switch_state(f"Image build failed for {label}: {img_msg[:120]}")
+                return
             # Stop llama.cpp if it is active
             if current_active and not _key_is_vllm(current_active):
                 _append_log_event("info", "switch", "Stopping current llama.cpp model...")
@@ -3066,6 +3679,7 @@ def start_vllm_switch(
                     STATE["last_completed_at"] = now_iso()
                     STATE["last_message"] = f"Compose file not found: {compose_path.name}"
                 return
+
 
             _append_log_event("info", "switch", f"Starting {label}...")
             cmd = [
@@ -3359,6 +3973,12 @@ def init_metrics_db() -> bool:
                     )
                     """
                 )
+                # Scheduler gauges, added 2026-09-27. ALTER rather than CREATE so an existing
+                # samples table keeps its history; old rows read back as NULL.
+                have = {r[1] for r in conn.execute("PRAGMA table_info(samples)")}
+                for col in ("running", "waiting", "ctx_pct"):
+                    if col not in have:
+                        conn.execute(f"ALTER TABLE samples ADD COLUMN {col} REAL")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS benchmarks (
@@ -3407,7 +4027,34 @@ def init_metrics_db() -> bool:
         return False
 
 
-def note_live_throughput(tps, ingest) -> None:
+def note_live_context(context_info: dict) -> None:
+    """Work out the charted context % and cache it for the sampler (2026-09-29/30).
+
+    Order: a live per-request figure (TabbyAPI shim; climbs during prefill) -> 0 when that
+    engine reports nothing in flight -> KV-pool share (vLLM, no per-request gauge) ->
+    llama.cpp slot n_past / n_ctx. Stored back as context_info["ctx_pct"] so the
+    browser's live chart shows exactly what the sampler stores.
+    """
+    pct = None
+    n_past, n_ctx = context_info.get("n_past"), context_info.get("n_ctx")
+    used, pool = context_info.get("pool_used"), context_info.get("pool_tokens")
+    have_window = isinstance(n_past, (int, float)) and isinstance(n_ctx, (int, float)) and n_ctx > 0
+    if context_info.get("n_past_live") and have_window:
+        pct = 100.0 * float(n_past) / float(n_ctx)
+    elif context_info.get("live_ctx_supported"):
+        pct = 0.0
+    elif isinstance(used, (int, float)) and isinstance(pool, (int, float)) and pool > 0:
+        pct = 100.0 * float(used) / float(pool)
+    elif not context_info.get("n_past_is_average") and have_window:
+        pct = 100.0 * float(n_past) / float(n_ctx)
+    if pct is not None:
+        pct = max(0.0, min(100.0, pct))
+    context_info["ctx_pct"] = pct
+    with METRICS_LIVE_LOCK:
+        METRICS_LIVE["ctx_pct"] = pct
+
+
+def note_live_throughput(tps, ingest, running=None, waiting=None) -> None:
     """Cache the newest throughput reading for the sampler.
 
     Throughput costs a docker exec to measure; the status endpoint already pays for it
@@ -3417,6 +4064,8 @@ def note_live_throughput(tps, ingest) -> None:
         METRICS_LIVE["ts"] = time.time()
         METRICS_LIVE["tps"] = float(tps) if isinstance(tps, (int, float)) else None
         METRICS_LIVE["ingest"] = float(ingest) if isinstance(ingest, (int, float)) else None
+        METRICS_LIVE["running"] = float(running) if isinstance(running, (int, float)) else None
+        METRICS_LIVE["waiting"] = float(waiting) if isinstance(waiting, (int, float)) else None
 
 
 def record_metric_sample() -> None:
@@ -3429,6 +4078,9 @@ def record_metric_sample() -> None:
         fresh = (time.time() - METRICS_LIVE["ts"]) <= METRICS_LIVE_MAX_AGE_SEC
         tps = METRICS_LIVE["tps"] if fresh else None
         ingest = METRICS_LIVE["ingest"] if fresh else None
+        running = METRICS_LIVE["running"] if fresh else None
+        waiting = METRICS_LIVE["waiting"] if fresh else None
+        ctx_pct = METRICS_LIVE["ctx_pct"] if fresh else None
 
     mem_total = gpu.get("mem_total") or 0
     mem_used = gpu.get("mem_used") or 0
@@ -3444,6 +4096,9 @@ def record_metric_sample() -> None:
         gpu.get("power"),
         gpu.get("temp"),
         gpu.get("fan"),
+        running,
+        waiting,
+        ctx_pct,
     )
     with METRICS_DB_LOCK:
         conn = _metrics_connect()
@@ -3451,8 +4106,8 @@ def record_metric_sample() -> None:
             # One row per wall-clock second; REPLACE keeps a restart from colliding.
             conn.execute(
                 "INSERT OR REPLACE INTO samples "
-                "(ts, util, vram_pct, vram_mb, tps, ingest, power, temp, fan) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "(ts, util, vram_pct, vram_mb, tps, ingest, power, temp, fan, running, waiting, ctx_pct) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 row,
             )
             conn.commit()
@@ -3496,7 +4151,12 @@ def read_metrics_history(range_key: str) -> dict:
                        AVG(tps)            AS tps,
                        MAX(tps)            AS tps_max,
                        AVG(ingest)         AS ingest,
-                       MAX(ingest)         AS ingest_max
+                       MAX(ingest)         AS ingest_max,
+                       AVG(waiting)        AS waiting,
+                       MAX(waiting)        AS waiting_max,
+                       MAX(running)        AS running_max,
+                       AVG(ctx_pct)        AS ctx_pct,
+                       MAX(ctx_pct)        AS ctx_pct_max
                 FROM samples
                 WHERE ts >= ?
                 GROUP BY b
@@ -3522,6 +4182,11 @@ def read_metrics_history(range_key: str) -> dict:
             "tps_max": rnd(r[7]),
             "ingest": rnd(r[8]),
             "ingest_max": rnd(r[9]),
+            "waiting": rnd(r[10]),
+            "waiting_max": rnd(r[11]),
+            "running_max": rnd(r[12]),
+            "ctx_pct": rnd(r[13]),
+            "ctx_pct_max": rnd(r[14]),
         }
         for r in rows
     ]
@@ -3858,8 +4523,9 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
                    "avg_prompt_per_request", "prefix_hit_rate", "external_prefix_hit_rate",
                    "prompt_cached_frac", "preemptions", "spec_present", "spec_accept_rate",
                    "spec_accept_len", "offload_read_bytes", "offload_store_bytes",
+                   "offload_load_count", "offload_tier_queries",
                    "offload_cpu_usage_perc", "success_by_reason", "waiting_by_reason",
-                   "kv_tokens_used", "kv_cache_size_tokens", "generation_tokens_total",
+                   "last_request_tps", "kv_tokens_used", "kv_cache_size_tokens", "generation_tokens_total",
                    "prompt_tokens_total", "total_requests_approx", "state", "gauge_age_sec"):
             model_stats[_k] = throughput.get(_k)
     # Hand the freshly-measured throughput to the metrics sampler so it never has to
@@ -3867,6 +4533,8 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
     note_live_throughput(
         model_stats.get("live_tps"),
         model_stats.get("last_live_ingest_tps") or model_stats.get("last_ingest_tps"),
+        model_stats.get("requests_running"),
+        model_stats.get("requests_waiting"),
     )
 
     context_info = {"n_ctx": None, "n_past": None}
@@ -3909,6 +4577,15 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
                 # No completed request yet on this boot — leave it unknown rather than
                 # substituting a pool number that means something else.
                 context_info["n_past"] = None
+            live_ctx = throughput.get("live_ctx_tokens")
+            if live_ctx is not None:
+                context_info["live_ctx_supported"] = True
+                live_target = throughput.get("live_ctx_target") or 0
+                if live_target > 0:
+                    context_info["n_past"] = min(ctx_size, int(live_ctx))
+                    context_info["n_past_target"] = min(ctx_size, int(live_target))
+                    context_info["n_past_is_average"] = False
+                    context_info["n_past_live"] = True
         except (ValueError, KeyError):
             pass
 
@@ -3946,10 +4623,12 @@ def build_status(handler: BaseHTTPRequestHandler | None = None) -> dict:
                 with CONTEXT_STATE_LOCK:
                     CONTEXT_STATE["last_good_n_past"] = computed_n_past
     # If still None or tiny, use last known good value
-    if (context_info["n_past"] is None or (isinstance(context_info["n_past"], int) and context_info["n_past"] < 10)):
+    if (not context_info.get("n_past_live")
+            and (context_info["n_past"] is None or (isinstance(context_info["n_past"], int) and context_info["n_past"] < 10))):
         last_good = ctx_state.get("last_good_n_past")
         if last_good is not None and last_good >= 10:
             context_info["n_past"] = last_good
+    note_live_context(context_info)
 
     # Safety valve: clear stale benchmark runs that never flipped state (e.g. worker crash).
     with BENCHMARK_LOCK:
@@ -4930,6 +5609,8 @@ INDEX_HTML = r"""<!doctype html>
     .sc-temp   { --sc: #f2555a; }
     .sc-pool    { --sc: #7c8cf8; }
     .sc-streams { --sc: #f77fb5; }
+    /* Queue depth lives in this sub-line; the default muted grey was too easy to miss. */
+    #val-streams-sub { color: var(--text-dim); }
     .sc-cache   { --sc: #34c3e8; }
     /* vLLM engine panel: dense two-column readouts, same visual weight as info-pair. */
     .eng-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; }
@@ -5029,6 +5710,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .mb-gen { color: #6fe3b6; border-color: rgba(33,201,138,0.24); background: rgba(33,201,138,0.09); }
     .mb-pre { color: #8fb8ff; border-color: rgba(79,141,251,0.24); background: rgba(79,141,251,0.09); }
+    .mb-ctx { color: #7fe3f0; border-color: rgba(56,198,217,0.28); background: rgba(56,198,217,0.10); }
     .mb-kv  { color: #d7b0ff; border-color: rgba(167,110,251,0.24); background: rgba(167,110,251,0.09); }
     .mb-unit { font-size: 8px; font-weight: 600; opacity: 0.6; letter-spacing: 0.2px; }
 
@@ -5387,6 +6069,7 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="eng-item"><div class="eng-label">Cache: GPU / host</div><div class="eng-value" id="eng-cachetiers">--</div></div>
                 <div class="eng-item"><div class="eng-label">Spec decode</div><div class="eng-value" id="eng-spec">--</div></div>
                 <div class="eng-item"><div class="eng-label">KV offload r/w</div><div class="eng-value" id="eng-offload">--</div></div>
+                <div class="eng-item"><div class="eng-label">KV tier promotions</div><div class="eng-value" id="eng-offload-loads">--</div></div>
                 <div class="eng-item"><div class="eng-label">Finish reasons</div><div class="eng-value" id="eng-finish">--</div></div>
               </div>
               <div class="eng-note" id="eng-note"></div>
@@ -5532,7 +6215,8 @@ INDEX_HTML = r"""<!doctype html>
     const history = {
       util: Array(60).fill(0), vram: Array(60).fill(0),
       tps: Array(60).fill(0), ingest: Array(60).fill(0),
-      power: Array(60).fill(0), temp: Array(60).fill(0), fan: Array(60).fill(0)
+      power: Array(60).fill(0), temp: Array(60).fill(0), fan: Array(60).fill(0),
+      queue: Array(60).fill(0), ctx: Array(60).fill(0)
     };
 
     // ── Chart time range ──────────────────────────────────────────────────────
@@ -5637,6 +6321,11 @@ INDEX_HTML = r"""<!doctype html>
       // reads as ~0. The bucket peak is the honest answer to "how fast did it run".
       chart.data.datasets[2].data = d.points.map(p => p.tps_max);
       chart.data.datasets[2].label = 'Gen Speed (peak T/S)';
+      // Peak, like speed: a bucket that queued for 30s of its 5 minutes averages to ~0.
+      chart.data.datasets[3].data = d.points.map(p => p.waiting_max);
+      chart.data.datasets[3].label = 'Queued (peak)';
+      chart.data.datasets[4].data = d.points.map(p => p.ctx_pct_max);
+      chart.data.datasets[4].label = 'Context % (peak)';
       chart.options.scales.x.display = true;
       chart.update();
 
@@ -5656,6 +6345,10 @@ INDEX_HTML = r"""<!doctype html>
       chart.data.datasets[1].data = history.vram;
       chart.data.datasets[2].data = history.tps;
       chart.data.datasets[2].label = 'Gen Speed (T/S)';
+      chart.data.datasets[3].data = history.queue;
+      chart.data.datasets[3].label = 'Queued';
+      chart.data.datasets[4].data = history.ctx;
+      chart.data.datasets[4].label = 'Context %';
       chart.options.scales.x.display = false;
       chart.update();
 
@@ -5725,7 +6418,12 @@ INDEX_HTML = r"""<!doctype html>
           datasets: [
             { label: 'GPU Util %', data: history.util, borderColor: '#4f8dfb', backgroundColor: fade('#4f8dfb'), fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
             { label: 'VRAM %',     data: history.vram, borderColor: '#21c98a', backgroundColor: fade('#21c98a'), fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
-            { label: 'Gen Speed (T/S)', data: history.tps, borderColor: '#f5a524', backgroundColor: fade('#f5a524'), fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' }
+            { label: 'Gen Speed (T/S)', data: history.tps, borderColor: '#f5a524', backgroundColor: fade('#f5a524'), fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
+            // Queue depth is a small integer; its own hidden axis keeps it off the % scale.
+            // Stepped, because 1.4 requests waiting is not a thing that happens.
+            { label: 'Queued', data: history.queue, borderColor: '#f2555a', backgroundColor: 'transparent', fill: false, stepped: true, pointRadius: 0, borderWidth: 1.5, borderDash: [4, 3], yAxisID: 'y2' },
+            // vLLM: KV pool in use; llama.cpp: active slot's share of its context window.
+            { label: 'Context %', data: history.ctx, borderColor: '#38c6d9', backgroundColor: 'transparent', fill: false, tension: 0.2, pointRadius: 0, borderWidth: 2, borderDash: [2, 2], yAxisID: 'y' }
           ]
         },
         options: {
@@ -5748,6 +6446,12 @@ INDEX_HTML = r"""<!doctype html>
               grid: { drawOnChartArea: false },
               ticks: { color: '#f5a524', font: { size: 11 }, padding: 8 },
               title: { display: true, text: 'Tokens/Sec', color: '#f5a524', font: { size: 10 } }
+            },
+            y2: {
+              display: false,
+              beginAtZero: true,
+              // Floor of 4 so one queued request sits low on the chart instead of at the top.
+              suggestedMax: 4
             },
             x: {
               display: false,
@@ -5907,6 +6611,17 @@ INDEX_HTML = r"""<!doctype html>
               + ` (${kvWhen})`;
             kvPill = `<span class="mb-pill mb-kv" title="${escHtml(kvT)}">\u25a4 ${fmtPool(tok)}<span class="mb-unit">kv</span></span>`;
           }
+          // Live context of the running request, on the active card only (2026-09-30).
+          let ctxPill = '';
+          if (active) {
+            const ci = data.context_info || {};
+            if (!ci.n_past_is_average && ci.n_ctx > 0 && ci.n_past > 0) {
+              const used = ci.n_past >= 1024 ? `${(ci.n_past/1024).toFixed(1)}k` : `${ci.n_past}`;
+              const pctTxt = `${(100 * ci.n_past / ci.n_ctx).toFixed(1)}% of ${Math.round(ci.n_ctx/1024)}k window`;
+              ctxPill = `<span class="mb-pill mb-ctx" title="${escHtml((ci.n_past_live ? 'Live context of the running request — ' : 'Context in use — ') + pctTxt)}">\u25d4 ${used}<span class="mb-unit">ctx</span></span>`;
+            }
+          }
+          kvPill = ctxPill + kvPill;
           // Measured speeds from the last successful benchmark, persisted per model.
           let benchRow = '';
           if (m.bench && (m.bench.gen_tps || m.bench.prefill_tps)) {
@@ -6105,10 +6820,14 @@ INDEX_HTML = r"""<!doctype html>
       // about the old pool-derived number, was the misleading part. Label what it is.
       const ctxIsAvg = ctxInfo.n_past_is_average === true;
       const ctxLabelEl = document.getElementById('stat-ctx-label');
-      if (ctxLabelEl) ctxLabelEl.textContent = ctxIsAvg ? 'Context / request' : 'Context';
+      const ctxLive = ctxInfo.n_past_live === true;
+      if (ctxLabelEl) ctxLabelEl.textContent = ctxLive ? 'Context (live)' : (ctxIsAvg ? 'Context / request' : 'Context');
       if (nCtx != null && nPast > 0) {
         const share = `${((nPast / nCtx) * 100).toFixed(1)}% of window`;
-        ctxSub.textContent = ctxIsAvg ? `avg per request · ${share}` : share;
+        const tgt = ctxInfo.n_past_target;
+        const filling = ctxLive && tgt > nPast + 1
+          ? `filling ${Math.round(100 * nPast / tgt)}% of ${tgt >= 1024 ? (tgt/1024).toFixed(1) + 'k' : tgt} · ` : '';
+        ctxSub.textContent = ctxIsAvg ? `avg per request · ${share}` : filling + share;
       } else if (nCtx != null) {
         ctxSub.textContent = ctxIsAvg ? 'no completed requests yet' : 'window idle';
       } else {
@@ -6190,6 +6909,11 @@ INDEX_HTML = r"""<!doctype html>
         } else if (run != null) {
           waitTxt = run > 0 ? 'no queue' : 'idle';
         }
+        // Engine's lifetime mean queue wait, so it stays meaningful between bursts.
+        const avgQ = stats.avg_queue_time_sec;
+        if (avgQ != null && run != null && (run > 0 || wait > 0)) {
+          waitTxt += ` · avg wait ${avgQ < 10 ? avgQ.toFixed(1) : Math.round(avgQ)}s`;
+        }
         document.getElementById('val-streams-sub').textContent = waitTxt;
         const sPct = (run != null && maxSeqs) ? Math.min(100, (run/maxSeqs)*100) : 0;
         document.getElementById('bar-streams').style.width = `${sPct.toFixed(1)}%`;
@@ -6249,6 +6973,14 @@ INDEX_HTML = r"""<!doctype html>
         document.getElementById('eng-offload').textContent =
           (stats.offload_read_bytes == null && stats.offload_store_bytes == null) ? '--'
           : `${fmtGB(stats.offload_read_bytes)} / ${fmtGB(stats.offload_store_bytes)}`;
+        const loads = stats.offload_load_count, tierQ = stats.offload_tier_queries;
+        const loadEl = document.getElementById('eng-offload-loads');
+        loadEl.textContent = loads == null
+          ? (tierQ == null ? '--' : `0 of ${Math.round(tierQ).toLocaleString()} lookups`)
+          : `${Math.round(loads).toLocaleString()}${tierQ ? ` of ${Math.round(tierQ).toLocaleString()} lookups` : ''}`;
+        // 0 promotions with lookups happening is the write-only failure mode worth seeing.
+        loadEl.className = 'eng-value' + (loads == null ? (tierQ ? ' warn' : '') : ' good');
+
         const sbr = stats.success_by_reason || {};
         const finish = Object.entries(sbr).filter(([, v]) => v > 0)
           .sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${Math.round(v)}`).join(' · ');
@@ -6279,6 +7011,13 @@ INDEX_HTML = r"""<!doctype html>
       history.power.push(gpu.power || 0); history.power.shift();
       history.temp.push(gpu.temp || 0); history.temp.shift();
       history.fan.push(gpu.fan || 0); history.fan.shift();
+      history.queue.push(stats.requests_waiting || 0); history.queue.shift();
+      {
+        // Same value the sampler stores (see note_live_context on the server).
+        const ci = data.context_info || {};
+        const cp = ci.ctx_pct != null ? ci.ctx_pct : 0;
+        history.ctx.push(Math.max(0, Math.min(100, cp))); history.ctx.shift();
+      }
       // Track the card's real ceiling so the watts axis isn't dwarfed by a 280W limit.
       if (thermalChart && gpu.power_limit > 0) {
         thermalChart.options.scales.yw.suggestedMax = gpu.power_limit;
@@ -7366,7 +8105,85 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+HOST_SHM_DIR = Path(os.environ.get("HOST_SHM_DIR", "/host-shm"))
+SHM_SWEEP_INTERVAL_S = int(os.environ.get("SHM_SWEEP_INTERVAL_S", "60"))
+SHM_SWEEP_MIN_AGE_S = 120
+
+
+_VLLM_ENGINE_IMAGE_RE = re.compile(r"vllm|hyperqwen|qwen38-27b|gemma4-31b", re.I)
+
+
+def _vllm_engine_running() -> bool | None:
+    """True if any running container looks like a vLLM engine (image name or a
+    VLLM_* env var). None if docker could not be queried (fail safe)."""
+    try:
+        ids = subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True,
+                             timeout=20, check=True).stdout.split()
+        if not ids:
+            return False
+        out = subprocess.run(["docker", "inspect", *ids], capture_output=True, text=True,
+                             timeout=30, check=True).stdout
+        me = os.environ.get("HOSTNAME", "")
+        for c in json.loads(out):
+            if me and c.get("Id", "").startswith(me):
+                continue  # gpu-monitor itself carries VLLM_DIR etc.
+            cfg = c.get("Config") or {}
+            img = cfg.get("Image", "")
+            env = cfg.get("Env") or []
+            if any(e.startswith("VLLM_") for e in env):
+                return True
+            # proxies live in the vllm compose project too: match engine images only
+            if _VLLM_ENGINE_IMAGE_RE.search(img) and "proxy" not in img:
+                return True
+        return False
+    except Exception as e:
+        print(f"shm-sweep: docker query failed: {e}")
+        return None
+
+
+def sweep_orphan_vllm_shm() -> None:
+    """Delete leaked vLLM KV-offload regions. With ipc: host a stopped vLLM
+    engine leaves a ~24 GiB /dev/shm/vllm_offload_*.mmap in host RAM/swap."""
+    if not HOST_SHM_DIR.is_dir():
+        return
+    now = time.time()
+    cands = {p.name: p for p in HOST_SHM_DIR.glob("vllm_offload_*.mmap")
+             if now - p.stat().st_mtime > SHM_SWEEP_MIN_AGE_S}
+    if not cands:
+        return
+    # Only one vLLM engine runs at a time on this host. If none is running, no
+    # process can own an offload region, so every one left is a leak. While an
+    # engine runs, leave everything alone (its own boot sweep handles older ones).
+    if _vllm_engine_running() is not False:
+        return
+    for name, p in cands.items():
+        try:
+            size_gb = p.stat().st_size / 2**30
+            p.unlink()
+            msg = f"Removed orphaned vLLM shm region {name} ({size_gb:.1f} GiB)"
+            print(f"shm-sweep: {msg}")
+            try:
+                _append_log_event("info", "shm-sweep", msg)
+            except Exception:
+                pass
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"shm-sweep: failed to remove {name}: {e}")
+
+
+def _run_shm_sweeper() -> None:
+    while True:
+        try:
+            sweep_orphan_vllm_shm()
+        except Exception as e:
+            print(f"shm-sweep: error: {e}")
+        time.sleep(SHM_SWEEP_INTERVAL_S)
+
+
 def main() -> None:
+    threading.Thread(target=_run_shm_sweeper, daemon=True, name="shm-sweeper").start()
+
     if not SWITCH_SCRIPT.exists():
         raise SystemExit(f"Missing switch script: {SWITCH_SCRIPT}")
 

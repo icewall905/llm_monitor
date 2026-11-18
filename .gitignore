@@ -20,3 +20,6 @@ request-logs/
 dashboard-check.png
 .pi/
 playwright-tests/
+
+# hub/agent
+data/

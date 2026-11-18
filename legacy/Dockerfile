@@ -1,3 +1,4 @@
+# Legacy single-host dashboard. Build context is the repo root (see legacy/docker-compose.yml).
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -14,12 +15,12 @@ RUN apt-get update && \
       https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 && \
     chmod +x /usr/local/bin/ttyd
 
-COPY launch-monitor.sh /usr/local/bin/launch-monitor.sh
+COPY legacy/launch-monitor.sh /usr/local/bin/launch-monitor.sh
 COPY switch-llm.sh /gpu-monitor/switch-llm.sh
-COPY start-services.sh /usr/local/bin/start-services.sh
-COPY dashboard-server.py /usr/local/bin/dashboard-server.py
-COPY nginx.conf /etc/nginx/nginx.conf
-COPY btop.conf /tmp/btop.conf
+COPY legacy/start-services.sh /usr/local/bin/start-services.sh
+COPY legacy/dashboard-server.py /usr/local/bin/dashboard-server.py
+COPY legacy/nginx.conf /etc/nginx/nginx.conf
+COPY legacy/btop.conf /tmp/btop.conf
 RUN mkdir -p /gpu-monitor /root/.config/btop && \
     mv /tmp/btop.conf /root/.config/btop/btop.conf && \
     chmod +x /usr/local/bin/launch-monitor.sh /usr/local/bin/start-services.sh /gpu-monitor/switch-llm.sh

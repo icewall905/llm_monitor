@@ -1,0 +1,46 @@
+# llm-agent for a GPU host. Copy next to that host's LLM stacks, edit the paths,
+# put AGENT_TOKEN=... in a .env beside it, then:
+#   docker compose -f compose.example.yml up -d --build
+# and add http://<this-host>:9360 with the same token in the hub (Settings → Hosts).
+#
+# Paths are mounted at the SAME path inside the container so the docker compose
+# labels on running stacks match what the agent sees.
+
+services:
+  llm-agent:
+    build:
+      # Path to a checkout of the gpu-monitor repo (the agent image needs
+      # agent/ and switch-llm.sh from it).
+      context: /path/to/gpu-monitor
+      dockerfile: agent/Dockerfile
+    container_name: llm-agent
+    pid: "host"                       # per-process CPU/RAM for the GPU process table
+    environment:
+      - AGENT_TOKEN=${AGENT_TOKEN:?set AGENT_TOKEN in .env}
+      - AGENT_NAME=${AGENT_NAME:-my-gpu-box}
+      # Stack folders: any of these may be absent; that backend is then skipped.
+      - LLAMA_DIR=/srv/llm/llama.cpp
+      - STACKS_DIR=/srv/llm/llama.cpp/stacks
+      - LLAMA_WORKING_DIR_LABEL=/srv/llm/llama.cpp
+      - VLLM_DIR=/srv/llm/vllm
+      - VLLM_API_KEY_FILE=/srv/llm/vllm/api_key.txt
+      # Request log written by the access-logger proxies; metrics history lives beside it.
+      - REQUEST_LOG_DB=/request-logs/requests.db
+      - METRICS_DB=/request-logs/metrics.db
+      - DASHBOARD_SETTINGS=/request-logs/settings.json
+    ports:
+      - "9360:9360"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /srv/llm/llama.cpp:/srv/llm/llama.cpp:ro
+      - /srv/llm/vllm:/srv/llm/vllm:ro
+      - /srv/llm/llama.cpp/request-logs:/request-logs:rw
+      - /dev/shm:/host-shm:rw
+      # NVIDIA userspace from the host (adjust the versioned .so to your driver), or
+      # use `runtime: nvidia` / deploy.resources.reservations.devices instead.
+      - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+    restart: always

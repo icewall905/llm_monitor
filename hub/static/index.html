@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>LLM Fleet</title>
+  <meta name="theme-color" content="#0a0c10">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='10' y='14' width='44' height='36' rx='9' fill='%230f1a2a' stroke='%235ec2ff' stroke-width='4'/%3E%3Ccircle cx='25' cy='31' r='5' fill='%235ec2ff'/%3E%3Ccircle cx='39' cy='31' r='5' fill='%235ec2ff'/%3E%3Crect x='24' y='41' width='16' height='3' rx='1.5' fill='%236fe58d'/%3E%3Crect x='30' y='6' width='4' height='8' rx='2' fill='%235ec2ff'/%3E%3Ccircle cx='32' cy='5' r='3' fill='%236fe58d'/%3E%3C/svg%3E">
+  <script>
+    // Apply the theme before first paint so there is no flash.
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem('theme'); } catch (e) {}
+      if (!t) t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.dataset.theme = t;
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.min.css">
+  <link rel="stylesheet" href="css/app.css">
+  <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.iife.min.js"></script>
+</head>
+<body>
+  <div class="app" id="app">
+    <nav class="rail" id="rail" aria-label="Primary"></nav>
+    <header class="topbar" id="topbar"></header>
+    <main class="main" id="main"></main>
+  </div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

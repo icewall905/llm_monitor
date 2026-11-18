@@ -1,34 +1,74 @@
+# LLM Fleet: hub (web dashboard) + the agent for this GPU host.
+#
+# Other GPU hosts only run an agent (see agent/compose.example.yml) and are added
+# in the hub under Settings → Hosts.
+#
+# Requires AGENT_TOKEN in .env (generate: openssl rand -base64 32).
+# The legacy single-host dashboard lives in legacy/.
+
 services:
-  gpu-monitor:
-    build: .
+  hub:
+    build: ./hub
+    # Named gpu-monitor: the reverse proxy (10.0.10.60) wakes it through Sablier by this name.
     container_name: gpu-monitor
+    environment:
+      - HUB_PORT=80
+      # First start only: register the local agent. Afterwards hosts are managed in
+      # Settings and stored in ./data/hub/nodes.json.
+      - HUB_LOCAL_AGENT_URL=http://agent:9360
+      - HUB_LOCAL_AGENT_TOKEN=${AGENT_TOKEN:?set AGENT_TOKEN in .env}
+      - HUB_LOCAL_AGENT_NAME=${AGENT_NAME:-rtx3090}
+      # Optional JSON list of {name,url,token,color} registered on first start (wins over the local agent above).
+      - HUB_BOOTSTRAP_NODES=${HUB_BOOTSTRAP_NODES:-}
+      # Optional basic auth for the dashboard itself.
+      - HUB_PASSWORD=${HUB_PASSWORD:-}
+    ports:
+      - "9358:80"
+    volumes:
+      - ./data/hub:/data
+    depends_on:
+      - agent
+    restart: always
+
+  agent:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    container_name: llm-agent
     pid: "host"
     environment:
-      - MONITOR_APP=nvtop
-      - DASHBOARD_PORT=8080
-      - TTYD_INTERNAL_PORT=7681
+      - AGENT_TOKEN=${AGENT_TOKEN:?set AGENT_TOKEN in .env}
+      - AGENT_NAME=${AGENT_NAME:-rtx3090}
+      - AGENT_PORT=9360
       - DASHBOARD_CONFIG=/gpu-monitor/config.yaml
+      - DASHBOARD_CONFIG_LOCAL=/gpu-monitor/config.local.yaml
       - LLAMA_DIR=${LLAMA_DIR:-/mnt/nvmestorage/compose/llama.cpp}
       - STACKS_DIR=${STACKS_DIR:-/mnt/nvmestorage/compose/llama.cpp/stacks}
       - MODELS_DIR=${MODELS_DIR:-/mnt/nvmestorage/compose/llama.cpp/models}
       - LLAMA_WORKING_DIR_LABEL=${LLAMA_WORKING_DIR_LABEL:-/mnt/nvmestorage/compose/llama.cpp}
       - REQUEST_LOG_DB=${REQUEST_LOG_DB:-/request-logs/requests.db}
+      - METRICS_DB=/request-logs/metrics.db
+      - DASHBOARD_SETTINGS=/request-logs/settings.json
       - VLLM_DIR=${VLLM_DIR:-/mnt/nvmestorage/compose/vllm}
       - VLLM_SERVER_SERVICE=${VLLM_SERVER_SERVICE:-vllm-server}
       - VLLM_API_KEY_FILE=${VLLM_API_KEY_FILE:-/mnt/nvmestorage/compose/vllm/qwen38-27b-rtx3090/api_key.txt}
       - BEELLAMA_DIR=${BEELLAMA_DIR:-/mnt/nvmestorage/compose/beellama.cpp}
-    stdin_open: true
-    tty: true
     ports:
-      - "9358:80"
-      - "9359:7681"
+      # Published so a hub on another machine can reach this agent. Token required.
+      - "9360:9360"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/nvmestorage/compose/llama.cpp:/mnt/nvmestorage/compose/llama.cpp:ro
-      # Request log DB (read-write so the SQLite WAL reader can open -wal/-shm sidecars)
+      # Request log + metrics/benchmark history (rw so SQLite can open -wal/-shm sidecars)
       - /mnt/nvmestorage/compose/llama.cpp/request-logs:/request-logs:rw
       - /mnt/nvmestorage/compose/vllm:/mnt/nvmestorage/compose/vllm:ro
       - /mnt/nvmestorage/compose/beellama.cpp:/mnt/nvmestorage/compose/beellama.cpp:ro
+      # Build contexts so a switch can rebuild pruned stack images (ensure_stack_images).
+      - /mnt/nvmestorage/compose/tabbyapi/src:/mnt/nvmestorage/compose/tabbyapi/src:ro
+      - /mnt/nvmestorage/compose/strata/Strata:/mnt/nvmestorage/compose/strata/Strata:ro
+      - /mnt/nvmestorage/compose/strata/image-curl:/mnt/nvmestorage/compose/strata/image-curl:ro
+      # Host /dev/shm: the sweeper deletes leaked vLLM offload regions.
+      - /dev/shm:/host-shm:rw
       - ./config.yaml:/gpu-monitor/config.yaml:ro
       - ./config.local.yaml:/gpu-monitor/config.local.yaml:ro
       - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro

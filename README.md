@@ -44,6 +44,8 @@ Set `HUB_PASSWORD` in `.env` to put basic auth on the dashboard.
 
 ## Add another GPU host
 
+Full walkthrough with troubleshooting: [docs/adding-a-host.md](docs/adding-a-host.md).
+
 1. Copy `agent/compose.example.yml` to the host, adjust the stack paths (mount them
    at the same path inside the container) and set `AGENT_TOKEN` in a `.env` beside it.
 2. `docker compose -f compose.example.yml up -d --build`

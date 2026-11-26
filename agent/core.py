@@ -3404,6 +3404,160 @@ def run_single_benchmark(
     )
 
 
+# ── Benchmark request gate (added 2026-11-26) ────────────────────────────────
+# Clean numbers need an idle engine. Every client reaches the model through an
+# access-logger container (the single choke point; see access-logger.py "Benchmark
+# gate"), which exposes a lease-based hold/release API on 127.0.0.1:8099 inside the
+# container. Around a benchmark we: close the gate (new requests wait there), wait
+# for the requests already past it to finish, run the benchmark directly against
+# the engine, then reopen the gate so the held requests resume in order.
+# The hold is a lease renewed every BENCHMARK_GATE_RENEW_SEC; if the agent dies the
+# logger reopens on its own after BENCHMARK_GATE_TTL_SEC.
+BENCHMARK_GATE_PORT = int(os.environ.get("BENCHMARK_GATE_PORT", "8099"))
+BENCHMARK_GATE_TTL_SEC = int(os.environ.get("BENCHMARK_GATE_TTL_SEC", "120"))
+BENCHMARK_GATE_RENEW_SEC = int(os.environ.get("BENCHMARK_GATE_RENEW_SEC", "30"))
+BENCHMARK_DRAIN_TIMEOUT_SEC = int(os.environ.get("BENCHMARK_DRAIN_TIMEOUT_SEC", "900"))
+BENCHMARK_GATE_ENABLED = os.environ.get("BENCHMARK_GATE", "true").lower() in ("1", "true", "yes", "on")
+
+_GATE_CLIENT = (
+    "import sys,urllib.request;"
+    "r=urllib.request.Request(sys.argv[1],method=sys.argv[2],data=b'' if sys.argv[2]=='POST' else None);"
+    "print(urllib.request.urlopen(r,timeout=5).read().decode())"
+)
+
+
+def find_access_logger_containers() -> list[str]:
+    """Running containers that bind-mount access-logger.py (vLLM fleet or a llama.cpp stack)."""
+    code, out = run_command(["docker", "ps", "-q"])
+    ids = out.split() if code == 0 else []
+    if not ids:
+        return []
+    code, out = run_command([
+        "docker", "inspect", "--format",
+        "{{.Name}}|{{range .Mounts}}{{.Source}};{{end}}", *ids,
+    ])
+    if code != 0:
+        return []
+    names = []
+    for line in out.splitlines():
+        name, _, mounts = line.partition("|")
+        if any(m.endswith("/access-logger.py") for m in mounts.split(";")):
+            names.append(name.lstrip("/"))
+    return sorted(names)
+
+
+def _gate_call(container: str, method: str, path: str) -> dict | None:
+    url = f"http://127.0.0.1:{BENCHMARK_GATE_PORT}{path}"
+    code, out = run_command(["docker", "exec", container, "python", "-c", _GATE_CLIENT, url, method])
+    if code != 0:
+        return None
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+class BenchmarkRequestGate:
+    """Context manager: hold client traffic, drain in-flight requests, release on exit.
+
+    `error` is set (and the gate already reopened) when draining timed out; the
+    caller must then skip the benchmark."""
+
+    def __init__(self, progress_cb=None):
+        self.progress_cb = progress_cb
+        self.containers: list[str] = []
+        self.error: str | None = None
+        self._stop = threading.Event()
+        self._renewer: threading.Thread | None = None
+
+    def _progress(self, msg: str) -> None:
+        if callable(self.progress_cb):
+            self.progress_cb(msg)
+
+    def _hold_all(self) -> list[str]:
+        ok = []
+        for c in self.containers:
+            if _gate_call(c, "POST", f"/gate/hold?ttl={BENCHMARK_GATE_TTL_SEC}&owner=gpu-monitor-benchmark"):
+                ok.append(c)
+        return ok
+
+    def _renew_loop(self) -> None:
+        while not self._stop.wait(BENCHMARK_GATE_RENEW_SEC):
+            self._hold_all()
+
+    def _release_all(self) -> int:
+        released = 0
+        for c in self.containers:
+            st = _gate_call(c, "POST", "/gate/release")
+            if st is None:
+                _append_log_event("warning", "benchmark",
+                                  f"Could not reopen request gate on {c}; it reopens itself "
+                                  f"within {BENCHMARK_GATE_TTL_SEC}s")
+            else:
+                released += int(st.get("waiting") or 0)
+        return released
+
+    def __enter__(self) -> "BenchmarkRequestGate":
+        if not BENCHMARK_GATE_ENABLED:
+            return self
+        found = find_access_logger_containers()
+        if not found:
+            _append_log_event("warning", "benchmark",
+                              "No access-logger container found; benchmarking without holding client requests")
+            return self
+        self.containers = found
+        held = self._hold_all()
+        missing = sorted(set(found) - set(held))
+        if missing:
+            _append_log_event("warning", "benchmark",
+                              f"Request gate unavailable on {', '.join(missing)} (restart it to load the "
+                              "gate-capable access-logger.py); its traffic is NOT held")
+        self.containers = held
+        if not held:
+            return self
+        _append_log_event("info", "benchmark", f"Holding new client requests at {', '.join(held)}")
+        self._renewer = threading.Thread(target=self._renew_loop, daemon=True, name="bench-gate-renew")
+        self._renewer.start()
+        try:
+            self._drain()
+        except BaseException:
+            self._close()
+            raise
+        return self
+
+    def _drain(self) -> None:
+        held = self.containers
+        deadline = time.time() + BENCHMARK_DRAIN_TIMEOUT_SEC
+        while True:
+            states = [_gate_call(c, "GET", "/gate") for c in held]
+            active = sum(int((st or {}).get("active") or 0) for st in states)
+            waiting = sum(int((st or {}).get("waiting") or 0) for st in states)
+            if active == 0 and all(st is not None for st in states):
+                break
+            if time.time() >= deadline:
+                self.error = (f"{active} in-flight request(s) still running after "
+                              f"{BENCHMARK_DRAIN_TIMEOUT_SEC}s; benchmark skipped")
+                self._close()
+                return
+            self._progress(f"Benchmark: waiting for {active} in-flight request(s) to finish"
+                           f" ({waiting} new request(s) held)...")
+            time.sleep(1.0)
+        _append_log_event("info", "benchmark", "In-flight requests drained; engine idle")
+
+    def _close(self) -> None:
+        if not self.containers:
+            return
+        self._stop.set()
+        released = self._release_all()
+        _append_log_event("info", "benchmark",
+                          f"Request gate reopened; {released} held request(s) resumed")
+        self.containers = []
+
+    def __exit__(self, *_exc) -> bool:
+        self._close()
+        return False
+
+
 def run_benchmark_profile(
     active_key: str,
     containers: list[dict],

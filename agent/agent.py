@@ -192,12 +192,19 @@ def action_benchmark(body: dict) -> tuple[int, dict]:
         model_label = models[model_key]["label"]
         core._append_log_event("info", "benchmark", f"Benchmark ({benchmark_profile}) started for {model_label}")
         try:
-            result, error = core.run_benchmark_profile(
-                model_key,
-                core.list_llama_compose_containers(),
-                benchmark_profile,
-                progress_cb=lambda msg: core._set_last_message(msg),
-            )
+            # Hold new client requests and drain running ones so the engine is idle,
+            # then reopen the gate however the benchmark ends.
+            with core.BenchmarkRequestGate(progress_cb=core._set_last_message) as gate:
+                if gate.error:
+                    error = gate.error
+                else:
+                    core._set_last_message(f"Running {benchmark_profile} benchmark for {model_label}...")
+                    result, error = core.run_benchmark_profile(
+                        model_key,
+                        core.list_llama_compose_containers(),
+                        benchmark_profile,
+                        progress_cb=lambda msg: core._set_last_message(msg),
+                    )
         except Exception as exc:  # noqa: BLE001
             error = f"Unhandled benchmark error: {exc}"
 
